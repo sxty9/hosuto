@@ -277,11 +277,19 @@ NoNewPrivileges=false
 # LockPersonality, RestrictAddressFamilies, SystemCallFilter): on a User= unit systemd can only
 # install those filters by forcing NoNewPrivileges=yes, which is exactly what must not happen here.
 # The namespace-based ones are safe, and are kept.
-ProtectSystem=full
+# ProtectSystem=true, NOT full. The difference is /etc, and it is load-bearing: this daemon escalates
+# to \$WRAPPER, which runs useradd/userdel (writing /etc/passwd, /etc/shadow, /etc/group, /etc/subuid
+# and their lock files) and installs the per-server systemd drop-in under /etc/systemd/system. The
+# wrapper runs via sudo INSIDE this unit's mount namespace, so it inherits these protections. Under
+# ProtectSystem=full /etc is read-only there, useradd fails with the misleading "cannot lock
+# /etc/passwd; try again later", and every server create dies at account creation — and
+# ReadWritePaths=/etc does NOT reliably punch that hole back open for /etc. ProtectSystem=true keeps
+# /usr and /boot read-only (the protection that matters) while leaving /etc writable, which is what a
+# service that manages system users and units actually needs.
+ProtectSystem=true
 ProtectHome=true
 PrivateTmp=true
-# The state file (accounts, servers, rcon passwords) and every server tree live here. It is the one
-# path the daemon writes; ProtectSystem=full keeps /etc and /usr read-only around it.
+# accounts/servers/rcon passwords + every server tree live here.
 ReadWritePaths=$STATE_DIR
 
 [Install]
