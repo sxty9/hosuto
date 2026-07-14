@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# hosuto-run <serverdir> — the ExecStart of hosuto-mc@.service.
+#
+# NOT a privileged wrapper: systemd has already dropped to User=<owner> before this runs, and it is
+# in no sudoers file. It exists for one reason: the launch command line of a Minecraft server is not
+# a constant. It depends on the loader (vanilla/Paper are `java -jar server.jar nogui`, NeoForge is
+# `java @user_jvm_args.txt @…/unix_args.txt nogui`), on the Java major the version demands, and on
+# the heap. hosutod writes that argv into <dir>/exec.argv when it installs or re-installs the server,
+# so a version or loader change is a file write plus a restart — no unit rewrite, no daemon-reload.
+#
+# It re-derives its own guards anyway (the tree must be inside the servers root, and a game server is
+# never run by a system account), because a launcher that trusts its argument is a launcher that can
+# be pointed anywhere.
+set -euo pipefail
+
+ROOT=/var/lib/hosuto/servers
+
+die() { printf 'hosuto-run: %s\n' "$1" >&2; exit "${2:-2}"; }
+
+dir="${1:-}"
+[ -n "$dir" ] || die "usage: hosuto-run <serverdir> (HOSUTO_DIR is set by the instance drop-in)"
+
+# The backstop if the per-instance drop-in were ever lost or malformed: game code runs as the
+# server's OWN account (hs-<slug>) and as nothing else. Not root, not the hosuto daemon, and not the
+# human who owns the server — they are in sudo/lxd/holistic on a real host, and mod code must inherit
+# none of it. Asserting the NAME, not merely "uid >= 1000", is what makes that precise: a bare uid
+# check would happily run the server as the owner, which is exactly the outcome this forbids.
+me="$(id -un)"
+[ "$(id -u)" -ne 0 ] || die "refusing to run a game server as root" 3
+case "$me" in
+  hs-*) ;;
+  *) die "refusing to run a game server as '$me' — it must run as its own hs-* account" 3 ;;
+esac
+
+real="$(realpath -e -- "$dir" 2>/dev/null || true)"
+[ -n "$real" ] || die "no such server directory: $dir" 5
+rroot="$(realpath -m -- "$ROOT")"
+# Exactly two levels below the root — <owner>/<slug>, nothing deeper, nothing outside.
+[[ "$real" =~ ^"$rroot"/[^/]+/[^/]+$ ]] || die "server directory escapes $ROOT: $real" 3
+
+cd "$real" || die "cannot enter $real" 5
+
+# exec.argv: one argument per line, written by hosutod. Its absence means the install never finished —
+# say so, rather than crash-looping the unit on an unreadable error.
+[ -r exec.argv ] || die "no exec.argv in $real — the server was never installed" 5
+
+argv=()
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  argv+=("$line")
+done < exec.argv
+[ "${#argv[@]}" -gt 0 ] || die "exec.argv in $real is empty" 5
+
+# exec, so systemd's MainPID is the JVM itself: SIGTERM (the ExecStop backstop) reaches the server's
+# own shutdown hook instead of a shell that would swallow it.
+exec "${argv[@]}"

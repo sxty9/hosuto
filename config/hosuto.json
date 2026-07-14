@@ -1,0 +1,75 @@
+{
+  "service": "hosuto",
+  "version": 1,
+  "categories": [
+    {
+      "id": "network",
+      "label": "Network",
+      "description": "How players reach the game servers.",
+      "settings": [
+        {
+          "id": "zone",
+          "label": "Game DNS zone",
+          "type": "string",
+          "default": "mc.henrysoase.org"
+        },
+        {
+          "id": "routerApi",
+          "label": "mc-router API",
+          "type": "string",
+          "default": "http://127.0.0.1:25580"
+        },
+        {
+          "id": "portLo",
+          "label": "Game port pool — first",
+          "type": "int",
+          "default": 25601
+        },
+        {
+          "id": "portHi",
+          "label": "Game port pool — last",
+          "type": "int",
+          "default": 25699
+        }
+      ]
+    },
+    {
+      "id": "limits",
+      "label": "Limits",
+      "description": "Ceilings that keep one member from exhausting the host.",
+      "settings": [
+        {
+          "id": "maxServersPerUser",
+          "label": "Servers per member",
+          "type": "int",
+          "default": 3
+        },
+        {
+          "id": "maxHeapMB",
+          "label": "Maximum heap per server (MB)",
+          "type": "int",
+          "default": 4096
+        },
+        {
+          "id": "defaultHeapMB",
+          "label": "Default heap per server (MB)",
+          "type": "int",
+          "default": 2048
+        }
+      ]
+    },
+    {
+      "id": "sources",
+      "label": "Sources",
+      "description": "Upstream services hosuto downloads from.",
+      "settings": [
+        {
+          "id": "modrinthUserAgent",
+          "label": "Modrinth User-Agent",
+          "type": "string",
+          "default": "sxty9/hosuto (holistic services landscape)"
+        }
+      ]
+    }
+  ]
+}

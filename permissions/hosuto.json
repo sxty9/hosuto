@@ -1,0 +1,35 @@
+{
+  "service": "hosuto",
+  "version": 1,
+  "categories": [
+    {
+      "id": "servers",
+      "label": "Game servers",
+      "description": "Who may play on hosted servers, and who may host their own.",
+      "permissions": [
+        {
+          "id": "play",
+          "label": "Play on servers",
+          "description": "Link a game account, reach the servers others added you to, and download the client files.",
+          "group": "hp_hosuto_play",
+          "default": true
+        },
+        {
+          "id": "host",
+          "label": "Host own servers",
+          "description": "Create and run game servers. Each server commits memory, a port and a public domain.",
+          "group": "hp_hosuto_host",
+          "default": false
+        },
+        {
+          "id": "admin",
+          "label": "Administer all servers",
+          "description": "See and control every server on the host, not only your own.",
+          "group": "hp_hosuto_admin",
+          "default": false,
+          "dangerous": true
+        }
+      ]
+    }
+  ]
+}

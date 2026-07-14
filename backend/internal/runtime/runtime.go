@@ -1,0 +1,335 @@
+// Package runtime is hosuto's control plane for a game server's life: it owns the on-disk tree, the
+// systemd unit, the port allocation, the mc-router route and the live status.
+//
+// The privilege model, which everything here obeys:
+//
+//   - hosutod is unprivileged. Every OS-level write goes through the narrow, allow-listed wrapper
+//     /usr/local/sbin/hosuto-server, invoked as `sudo -n`. The wrapper re-derives every guard from
+//     the kernel and trusts nothing this package tells it.
+//   - A server's directory is <owner>:hosuto, mode 2770 (setgid). The GAME PROCESS runs as the
+//     OWNER — that is the isolation boundary, so a hostile mod is confined to its owner's rights.
+//     The daemon is in the group so it can manage the config files it owns (server.properties,
+//     whitelist.json, ops.json); it never runs game code.
+//   - RCON and the game port are bound to 127.0.0.1 (via server-ip in server.properties — there is
+//     no rcon.ip key). Nothing but mc-router and the daemon can reach a server.
+//
+// Reachability is deliberately two-sourced: systemd says whether the unit is running, and a Server
+// List Ping through mc-router says whether a player could actually connect. Only the second one is
+// the truth the "Erreichbarkeit" tab promises, so both are reported.
+package runtime
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"hosuto/internal/hconfig"
+	"hosuto/internal/mcfiles"
+	"hosuto/internal/mcnet"
+	"hosuto/internal/router"
+	"hosuto/internal/store"
+	"hosuto/internal/versions"
+)
+
+const (
+	// Root is the parent of every server tree. The wrapper independently confines writes to it.
+	Root = "/var/lib/hosuto/servers"
+	// wrapper is the ONLY command hosutod may run through sudo.
+	wrapper = "/usr/local/sbin/hosuto-server"
+
+	rconOffset = 100 // rcon port = game port + 100; keeps the two pools trivially disjoint
+)
+
+// ErrNoPort is returned when the game-port pool is exhausted.
+var ErrNoPort = errors.New("no free port in the pool")
+
+// Status is what the Erreichbarkeit tab shows.
+type Status struct {
+	State     string   `json:"state"`     // active | inactive | failed | activating
+	Reachable bool     `json:"reachable"` // a real Server List Ping succeeded
+	Online    int      `json:"online"`
+	Max       int      `json:"max"`
+	Sample    []string `json:"sample,omitempty"`
+}
+
+// Manager drives server lifecycles.
+type Manager struct {
+	st  *store.Store
+	cfg *hconfig.Config
+	rt  *router.Client
+	vc  *versions.Client
+}
+
+// New builds the manager.
+func New(st *store.Store, cfg *hconfig.Config, rt *router.Client, vc *versions.Client) *Manager {
+	return &Manager{st: st, cfg: cfg, rt: rt, vc: vc}
+}
+
+// Dir is a server's on-disk tree. Rebuilt from owner+slug, never stored, so a poisoned store record
+// cannot redirect a write. (The wrapper re-derives it too and refuses anything outside Root.)
+func Dir(owner, slug string) string { return filepath.Join(Root, owner, slug) }
+
+// Instance is the systemd template instance name.
+func Instance(owner, slug string) string { return owner + "-" + slug }
+
+// Unit is the full systemd unit name.
+func Unit(owner, slug string) string { return "hosuto-mc@" + Instance(owner, slug) + ".service" }
+
+// Host is a server's public domain.
+func (m *Manager) Host(slug string) string {
+	return slug + "." + m.cfg.String("zone", "mc.henrysoase.org")
+}
+
+// run invokes the privileged wrapper, surfacing its stderr (the wrapper is the one that knows why
+// it refused).
+func run(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "sudo", append([]string{"-n", wrapper}, args...)...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return errors.New(msg)
+		}
+		return err
+	}
+	return nil
+}
+
+// AllocatePorts picks a free game port (and its rcon partner) from the configured pool.
+//
+// It skips ports the store already handed out, then TEST-BINDS the candidate. The test bind sets
+// SO_REUSEADDR, because the JVM's ServerSocket does: without it a port left in TIME_WAIT by a
+// server that just stopped would read as a collision, and the pool would churn on every restart.
+func (m *Manager) AllocatePorts() (int, int, error) {
+	lo := m.cfg.Int("portLo", 25601)
+	hi := m.cfg.Int("portHi", 25699)
+	used := m.st.UsedPorts()
+	for p := lo; p <= hi; p++ {
+		if used[p] || used[p+rconOffset] {
+			continue
+		}
+		if free(p) && free(p+rconOffset) {
+			return p, p + rconOffset, nil
+		}
+	}
+	return 0, 0, ErrNoPort
+}
+
+// free test-binds a loopback port with SO_REUSEADDR (Go's net.Listen sets it by default, matching
+// the JVM).
+func free(port int) bool {
+	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+// Create lays down a server: the wrapper makes the tree and the unit drop-in, then hosuto installs
+// the server jar, writes the files it owns, and registers the mc-router route.
+//
+// It is written to be safely re-runnable: a half-created server (say, the jar download died) can be
+// created again without hand-cleanup.
+func (m *Manager) Create(ctx context.Context, srv store.Server) (store.Server, error) {
+	dir := Dir(srv.Owner, srv.Slug)
+
+	if err := run(ctx, "create", srv.Owner, srv.Slug,
+		strconv.Itoa(srv.HeapMB), strconv.Itoa(srv.Port), strconv.Itoa(srv.RconPort)); err != nil {
+		return srv, fmt.Errorf("create server tree: %w", err)
+	}
+
+	// Install the jar/loader. This is the slow part (a download plus, for NeoForge, an installer run).
+	argv, err := m.vc.Install(ctx, dir, srv.Loader, srv.MCVersion, srv.LoaderVersion, srv.HeapMB)
+	if err != nil {
+		return srv, fmt.Errorf("install %s %s: %w", srv.Loader, srv.MCVersion, err)
+	}
+	// The unit reads its ExecStart argv from this file, so a version/loader change is a file write
+	// plus a restart — no unit rewrite, no daemon-reload.
+	if err := os.WriteFile(filepath.Join(dir, "exec.argv"), []byte(strings.Join(argv, "\n")+"\n"), 0o640); err != nil {
+		return srv, err
+	}
+
+	if err := mcfiles.WriteEULA(filepath.Join(dir, "eula.txt")); err != nil {
+		return srv, err
+	}
+	if err := m.writeProps(srv); err != nil {
+		return srv, err
+	}
+	// Seed the owner into the whitelist. From JE 26.3 white-list defaults to true, so a server whose
+	// whitelist is empty would lock out even the person who just created it.
+	if acc, ok := m.st.Account(srv.Owner); ok {
+		_ = mcfiles.WriteWhitelist(filepath.Join(dir, "whitelist.json"),
+			[]mcfiles.Entry{{UUID: acc.UUID, Name: acc.Name}})
+		_ = mcfiles.WriteOps(filepath.Join(dir, "ops.json"),
+			[]mcfiles.Op{{UUID: acc.UUID, Name: acc.Name, Level: 4}})
+	}
+
+	if err := m.Route(ctx, srv); err != nil {
+		return srv, fmt.Errorf("register route: %w", err)
+	}
+	return srv, nil
+}
+
+// writeProps merges hosuto's owned keys over whatever is already in server.properties, so a key the
+// user or the server itself added survives.
+func (m *Manager) writeProps(srv store.Server) error {
+	path := filepath.Join(Dir(srv.Owner, srv.Slug), "server.properties")
+	p, err := mcfiles.ReadProps(path)
+	if err != nil {
+		return err
+	}
+	// server-ip binds BOTH the game port and rcon to loopback — there is no rcon.ip key. This single
+	// line is what keeps every backend unreachable except through mc-router.
+	p["server-ip"] = "127.0.0.1"
+	p["server-port"] = strconv.Itoa(srv.Port)
+	p["enable-rcon"] = "true"
+	p["rcon.port"] = strconv.Itoa(srv.RconPort)
+	p["rcon.password"] = srv.RconPass
+	p["broadcast-rcon-to-ops"] = "false"
+	// query.port defaults to the server port; leaving query enabled would collide with the game port.
+	p["enable-query"] = "false"
+	// Never false: each backend authenticates against Mojang itself. mc-router only splices bytes.
+	p["online-mode"] = "true"
+	p["white-list"] = strconv.FormatBool(srv.JoinPolicy == "whitelist")
+	// enforce-whitelist makes a `whitelist reload` kick players who are no longer on the list.
+	p["enforce-whitelist"] = "true"
+	if _, ok := p["motd"]; !ok {
+		p["motd"] = srv.Name
+	}
+	return mcfiles.WriteProps(path, p)
+}
+
+// SyncConfig re-applies the server.properties keys hosuto owns (after a policy or version change).
+func (m *Manager) SyncConfig(ctx context.Context, srv store.Server) error { return m.writeProps(srv) }
+
+// Route registers the server's domain with mc-router.
+func (m *Manager) Route(ctx context.Context, srv store.Server) error {
+	if !m.rt.Enabled() {
+		return nil
+	}
+	return m.rt.Put(ctx, srv.Host, "127.0.0.1:"+strconv.Itoa(srv.Port))
+}
+
+// Unroute drops the domain from mc-router.
+func (m *Manager) Unroute(ctx context.Context, srv store.Server) error {
+	if !m.rt.Enabled() {
+		return nil
+	}
+	return m.rt.Delete(ctx, srv.Host)
+}
+
+// SyncRoutes reconciles mc-router's table with the servers hosuto knows about. Called on daemon
+// start so a crash between "delete server" and "delete route" cannot orphan a route that would keep
+// pointing a live public domain at a recycled port.
+func (m *Manager) SyncRoutes(ctx context.Context) error {
+	if !m.rt.Enabled() {
+		return nil
+	}
+	want := map[string]string{}
+	for _, srv := range m.st.Servers() {
+		want[srv.Host] = "127.0.0.1:" + strconv.Itoa(srv.Port)
+	}
+	return m.rt.Sync(ctx, want)
+}
+
+// Start/Stop/Restart drive the unit through the wrapper.
+func (m *Manager) Start(ctx context.Context, srv store.Server) error {
+	return run(ctx, "start", srv.Owner, srv.Slug)
+}
+func (m *Manager) Stop(ctx context.Context, srv store.Server) error {
+	return run(ctx, "stop", srv.Owner, srv.Slug)
+}
+func (m *Manager) Restart(ctx context.Context, srv store.Server) error {
+	return run(ctx, "restart", srv.Owner, srv.Slug)
+}
+
+// Destroy stops the unit, removes the drop-in and deletes the tree — and drops the route first, so a
+// failure half-way cannot leave a public domain pointing at a port that is about to be reused.
+func (m *Manager) Destroy(ctx context.Context, srv store.Server) error {
+	if err := m.Unroute(ctx, srv); err != nil {
+		return fmt.Errorf("drop route: %w", err)
+	}
+	return run(ctx, "destroy", srv.Owner, srv.Slug)
+}
+
+// State asks systemd whether the unit is running. Cheap; safe to call per row.
+func (m *Manager) State(ctx context.Context, srv store.Server) string {
+	out, _ := exec.CommandContext(ctx, "systemctl", "is-active", Unit(srv.Owner, srv.Slug)).Output()
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return "inactive"
+	}
+	return s
+}
+
+// Status combines systemd's view with a real Server List Ping.
+//
+// The ping goes to the LOCAL backend port but sends the PUBLIC hostname in the handshake, which is
+// what a player's client does and what mc-router routes on. A server can be "active" to systemd and
+// still be unreachable (still loading the world, or bound wrong), so the two are reported separately
+// rather than collapsed into one lie.
+func (m *Manager) Status(ctx context.Context, srv store.Server) Status {
+	st := Status{State: m.State(ctx, srv)}
+	if st.State != "active" {
+		return st
+	}
+	ping, err := mcnet.Ping(ctx, "127.0.0.1:"+strconv.Itoa(srv.Port), srv.Host, srv.Port, 2*time.Second)
+	if err != nil {
+		return st // running, but not yet answering — the world is probably still loading
+	}
+	st.Reachable = true
+	st.Online, st.Max, st.Sample = ping.Online, ping.Max, ping.Sample
+	return st
+}
+
+// rcon opens an authenticated RCON connection to a running server.
+func (m *Manager) rcon(srv store.Server) (*mcnet.Conn, error) {
+	return mcnet.Dial("127.0.0.1:"+strconv.Itoa(srv.RconPort), srv.RconPass, 5*time.Second)
+}
+
+// ApplyWhitelist writes whitelist.json + ops.json and, if the server is running, makes it take
+// effect immediately.
+//
+// The files are the source of truth (they survive a restart); the RCON reload is what makes a change
+// land on a LIVE server without bouncing it. If the server is down, the file write is enough and the
+// RCON failure is not an error — that distinction is the whole point of doing both.
+func (m *Manager) ApplyWhitelist(ctx context.Context, srv store.Server, players []mcfiles.Entry, ops []mcfiles.Op) error {
+	dir := Dir(srv.Owner, srv.Slug)
+	if err := mcfiles.WriteWhitelist(filepath.Join(dir, "whitelist.json"), players); err != nil {
+		return err
+	}
+	if err := mcfiles.WriteOps(filepath.Join(dir, "ops.json"), ops); err != nil {
+		return err
+	}
+	if m.State(ctx, srv) != "active" {
+		return nil
+	}
+	c, err := m.rcon(srv)
+	if err != nil {
+		return nil // running but rcon not up yet (world still loading); the files are already correct
+	}
+	defer c.Close()
+	_, _ = c.Cmd("whitelist reload")
+	return nil
+}
+
+// Say sends a chat line to a running server (used to tell players a change landed).
+func (m *Manager) Say(ctx context.Context, srv store.Server, msg string) {
+	if m.State(ctx, srv) != "active" {
+		return
+	}
+	c, err := m.rcon(srv)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	_, _ = c.Cmd("say " + msg)
+}

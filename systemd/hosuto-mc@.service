@@ -1,0 +1,111 @@
+# hosuto-mc@<owner>-<slug>.service — one Minecraft server.
+#
+# Installed root:root 0644 at /etc/systemd/system/hosuto-mc@.service by `./service setup`. This is
+# the half of the unit that is the same for every server; the half that is not — User=, the tree,
+# WorkingDirectory=, ReadWritePaths=, MemoryMax=/MemoryHigh= — is written per instance by
+# `hosuto-server create` into hosuto-mc@<instance>.service.d/instance.conf. Both halves are
+# root-owned: the owner can do anything they like INSIDE their server directory and still cannot
+# change how their server is launched.
+#
+# The instance name is "<owner>-<slug>". It is never parsed back apart (a username may contain '-'
+# too); the concrete paths arrive through the drop-in's HOSUTO_DIR.
+[Unit]
+Description=Minecraft server %i (hosuto)
+After=network.target
+# StartLimit* MUST live in [Unit]. In [Service] systemd parses them, warns once, and IGNORES them —
+# a crash-looping server would then restart forever. Three failures in ten minutes is a broken world
+# or a bad mod, not a transient fault: stop and let the owner see `failed` in the UI.
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# Type=simple means systemd calls this unit ACTIVE at fork() — 60-120 seconds before the world has
+# finished loading and RCON has bound. Everything downstream is built around that lie: hosutod pings
+# the server itself before it reports "reachable", and hosuto-stop retries until RCON answers rather
+# than SIGTERM-ing a half-loaded world. (Type=notify is not available: the JVM does not talk sd_notify.)
+
+# The launch argv is not a constant — it depends on the loader, the Java major and the heap — so
+# hosutod writes it into <dir>/exec.argv on install, and hosuto-run turns it into this process. A
+# version change is then a file write plus a restart: no unit rewrite, no daemon-reload.
+# ${HOSUTO_DIR} comes from the per-instance drop-in.
+ExecStart=/usr/local/sbin/hosuto-run ${HOSUTO_DIR}
+
+# A Minecraft server MUST save its world. hosuto-stop asks it to, over RCON (`/stop`), and waits for
+# the save to finish; systemd's SIGTERM — which follows the moment ExecStop returns — is the backstop
+# (vanilla does install a shutdown hook, mods may not). $MAINPID lets the helper wait on the JVM
+# itself. hosuto-stop always exits 0: a failing ExecStop would mark an ordinary stop as `failed`.
+ExecStop=/usr/local/sbin/hosuto-stop ${HOSUTO_DIR} $MAINPID
+# Loading, saving and shutting down a large modded world is minutes, not seconds. This is the budget
+# hosuto-stop's own deadlines (120s to reach RCON, 240s total) sit inside.
+TimeoutStopSec=300
+KillSignal=SIGTERM
+# Restart a server that died, not one that was stopped: systemd already treats SIGTERM/SIGINT/SIGHUP/
+# SIGPIPE as a clean exit, and /stop exits 0. RestartSec is long enough that a crash loop is visibly
+# a crash loop and not a fork bomb.
+Restart=on-failure
+RestartSec=15
+OOMPolicy=stop
+
+# journald's default rate limit is 10000 messages per 30s PER SERVICE, after which it DROPS the rest
+# and logs how many it threw away. A crashing server emits a stack-trace storm — exactly the output
+# the console needs — right at the moment it hits that ceiling. 0 disables the limit for this unit.
+LogRateLimitIntervalSec=0
+
+# ── resources ─────────────────────────────────────────────────────────────────────────
+# MemoryMax/MemoryHigh are per-instance (they are computed from the heap): see the drop-in. They are
+# deliberately NOT set to -Xmx — metaspace, the code cache, GC structures, thread stacks and direct
+# byte buffers all live outside the heap, and a cgroup limit of exactly Xmx gets the JVM OOM-killed
+# mid-world-load.
+# A Minecraft server is a few dozen threads plus the GC's; 512 is far above that and still bounds a
+# fork bomb. CPUQuota caps a runaway mod (or a spark of chunk generation) at two cores, so one server
+# cannot starve the host or its neighbours.
+TasksMax=512
+CPUQuota=200%
+
+# ── sandbox ───────────────────────────────────────────────────────────────────────────
+# The real isolation boundary is User=<owner> (in the drop-in): a hostile mod runs with exactly that
+# human's rights, and nothing more. These are the walls around that.
+# NoNewPrivileges also means the setuid bit is dead inside this unit — a mod cannot exec sudo even if
+# the owner happens to be an admin elsewhere on the host.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+# ReadWritePaths=<the server's own tree> is in the drop-in: the ONLY writable path in the filesystem.
+# ProtectHome=tmpfs, not `yes`: the JVM insists on a $HOME, and an empty tmpfs gives it one that is
+# not the owner's real home directory (the drop-in points HOME at the server tree in any case).
+ProtectHome=tmpfs
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# AF_NETLINK is not optional: glibc's getifaddrs(), which the JVM calls when it enumerates network
+# interfaces at startup, is a NETLINK socket. Dropping it makes the server fail to bind.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# Belt and braces over the run account. The JVM already runs as hs-<slug>, which is in no group that
+# can read any of these — but the whole point of a modded server is that it executes code nobody here
+# reviewed, so the two most valuable targets on the host are made to not exist inside its mount
+# namespace at all. /etc/holistic holds the shared JWT secret (forging it is a session as ANY user)
+# and every machine-to-machine secret; /var/lib/holistic holds the instance state and config values.
+# The leading '-' tolerates their absence on a host where the dashboard is not installed.
+InaccessiblePaths=-/etc/holistic -/var/lib/holistic
+# NOT InaccessiblePaths=/var/lib/hosuto/servers, tempting as it looks: systemd mounts an empty
+# directory over an inaccessible path, which would bury this server's OWN tree underneath it and no
+# ReadWritePaths= can dig it back out. The other servers are closed off by their modes instead —
+# each is 2770 hs-<slug>:hosuto, and this account is in neither.
+#
+# Deliberately NOT set: MemoryDenyWriteExecute (the JIT maps executable pages — it would break every
+# server) and SystemCallFilter (a JVM's syscall surface is wide; a filter here buys little and fails
+# obscurely). Re-verify on the target if you tighten further.
+
+[Install]
+# hosuto never enables an instance: a host reboot does not silently start every world on it. An
+# operator who wants one back automatically can `systemctl enable hosuto-mc@<owner>-<slug>`.
+WantedBy=multi-user.target

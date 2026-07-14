@@ -1,0 +1,14 @@
+# The /vision folder is DevLab's Vision Catalog for this service: idea deposits —
+# specs, mindmaps, screenshots, PDFs, notes — that collaborators attach and discuss.
+# DevLab reads this folder from the repo, so keep curated vision material TRACKED
+# (git.Tree honours .gitignore, so anything ignored here is invisible in DevLab).
+#
+# Ignore only throwaway/derived junk, never real vision docs:
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+node_modules/
+# Local render caches (e.g. exported previews) — keep the source, drop the derived:
+.cache/
+*.render.*

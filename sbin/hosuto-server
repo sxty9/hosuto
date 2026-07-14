@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# hosuto-server {create|start|stop|restart|destroy|status} <owner> <slug> [heapMB port rconPort]
+# — the privileged control plane for one game server. Installed root:root 0755 at
+# /usr/local/sbin/hosuto-server by `./service setup`, and invoked ONLY as:
+#
+#     sudo -n /usr/local/sbin/hosuto-server <verb> <owner> <slug> [args]
+#
+# THE CENTRAL RULE
+#   hosutod validates every one of these arguments before it calls — and that means nothing here.
+#   This script is independently reachable through sudo (any compromise of the hosuto account calls
+#   it directly), so it RE-DERIVES EVERY GUARD FROM THE KERNEL AND TRUSTS NOTHING IT IS TOLD:
+#
+#     • owner — must exist in /etc/passwd, have uid >= 1000, and be a member of `smbusers` (the
+#       holistic-managed human accounts). root and every system account are refused.
+#     • slug — ^[a-z][a-z0-9-]{1,27}$. It becomes a DNS label, a systemd instance name AND the run
+#       account's username (capped at 32 chars by useradd), so no dots, no slashes, no '@'.
+#     • paths — rebuilt from scratch as /var/lib/hosuto/servers/<owner>/<slug>. The realpath must
+#       come back EQUAL to that string: any symlink or '..' anywhere in the chain resolves somewhere
+#       else and the mismatch refuses the call. Nothing outside the root is ever touched.
+#     • ports — integers inside 25601-25799, game != rcon.
+#
+# THE ISOLATION BOUNDARY: the server runs as ITS OWN dedicated system account, hs-<slug>, created
+# here and destroyed with the server. It is NOT the owner's account.
+#
+#   The tempting design — run the game as the human who owns it, the way remshel runs their shell —
+#   is wrong here, and the difference is worth stating. remshel runs a LOGIN SHELL: being that human
+#   is the entire point, and the user cannot exceed rights they already have. A game server runs
+#   MOD CODE THE OWNER DID NOT WRITE. Handing it the owner's identity hands it the owner's groups —
+#   and on a real holistic host those include `sudo`, `lxd` and `holistic`, i.e. the shared JWT
+#   secret, which forges a session as ANY user. A modded server is precisely where third-party code
+#   runs, so it gets an identity of its own: no supplementary groups, no login shell, no home, no
+#   sudo, no secrets, nothing on the host it can read that is not its own world.
+#
+#   It is also strictly finer-grained than per-human isolation: two servers belonging to the SAME
+#   person cannot reach each other either.
+#
+# THE PERMISSION MODEL of a server tree — the one non-obvious part, so it is spelled out:
+#
+#     /var/lib/hosuto/servers/<owner>/<slug>   hs-<slug>:hosuto  2770  +ACL default u:hs-<slug>:rwx
+#
+#   The directory belongs to the RUN ACCOUNT (it writes the world) and its group is `hosuto`, because
+#   the unprivileged daemon has to create the jar, server.properties, whitelist.json and exec.argv
+#   inside it. Those files are written by hosutod, so they are uid=hosuto, and the setgid bit makes
+#   them gid=hosuto — which would leave the game process (uid=hs-<slug>, in neither) unable to read
+#   its own server.properties, since the daemon writes it 0640 (it carries the rcon password). The
+#   default ACL closes that gap: every file hosutod creates in the tree grants the run account read
+#   access too, and nobody else can even enter the directory (other=---).
+#
+# Exit codes: 0 ok · 2 bad request · 3 refused · 4 failed · 5 missing state
+set -euo pipefail
+
+ROOT=/var/lib/hosuto/servers      # every path is rebuilt under this root and re-checked against it
+SVC_USER=hosuto                   # the unprivileged daemon: owns the tree's group, never runs game code
+USERS_GROUP=smbusers              # the holistic-managed human accounts
+UNIT_PREFIX=hosuto-mc             # systemd template: hosuto-mc@<owner>-<slug>.service
+SYSTEMD_DIR=/etc/systemd/system
+PORT_LO=25601
+PORT_HI=25799
+HEAP_MIN=256                      # a JVM below this cannot boot a world; above HEAP_MAX is a typo
+HEAP_MAX=131072
+
+die() { printf 'hosuto-server: %s\n' "$1" >&2; exit "${2:-2}"; }
+
+[ "$(id -u)" -eq 0 ] || die "must run as root (invoked via sudo -n)" 3
+
+# ── guards, all re-derived ────────────────────────────────────────────────────────────
+# A holistic-managed human account, and nothing else. Every check reads the kernel's own view
+# (getent/id), never the caller's word.
+#
+# The owner is a hosuto-level concept — WHO controls this server in the UI. It is never the identity
+# the game runs as (see the run account below), so an owner who happens to be an admin, or in the
+# `holistic` group, is fine: none of their privileges reach the JVM.
+check_owner() {
+  local owner="$1" uid
+  [[ "$owner" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid owner"
+  getent passwd "$owner" >/dev/null || die "no such user: $owner"
+  uid="$(id -u "$owner")"
+  [ "$uid" -ge 1000 ] || die "$owner is a system account (uid $uid) — refusing" 3
+  id -nG "$owner" 2>/dev/null | tr ' ' '\n' | grep -qx "$USERS_GROUP" \
+    || die "$owner is not a holistic-managed account (not in $USERS_GROUP)" 3
+  return 0
+}
+
+check_slug() {
+  # 2-28 chars: "hs-<slug>" is also a Linux username, and useradd caps that at 32.
+  [[ "$1" =~ ^[a-z][a-z0-9-]{1,27}$ ]] || die "invalid slug"
+}
+
+# The server's own account: hs-<slug>. Derived from the validated slug alone, never passed in.
+runuser() { printf 'hs-%s' "$1"; }
+
+# ensure_runuser creates the locked-down system account the JVM runs as. Idempotent.
+#
+# --system (uid < 1000, so it can never be a holistic member), no home, nologin shell, and a private
+# primary group. It gets NO supplementary groups — in particular not `hosuto` (which would open every
+# other server's tree) and not `holistic` (the shared secrets). It is locked: nothing can log in as it.
+ensure_runuser() {
+  local ru="$1"
+  if ! getent passwd "$ru" >/dev/null; then
+    useradd --system --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin --user-group "$ru" \
+      || die "could not create the run account $ru" 4
+    passwd -l "$ru" >/dev/null 2>&1 || true
+  fi
+  # Re-assert on every create: an account that somehow acquired a supplementary group must not keep
+  # it. `id -nG` lists the primary group first; anything beyond it is removed.
+  #
+  # The `|| true` is load-bearing under `set -o pipefail`: grep exits 1 when it matches nothing,
+  # which is the NORMAL case here (a fresh account has no extra groups) and would otherwise abort the
+  # whole create with no message at all.
+  local extra
+  extra="$(id -nG "$ru" 2>/dev/null | tr ' ' '\n' | grep -vx "$ru" | paste -sd, - || true)"
+  if [ -n "$extra" ]; then
+    usermod -G "" "$ru" 2>/dev/null \
+      || die "run account $ru holds supplementary groups ($extra) that could not be removed" 3
+  fi
+}
+
+check_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || die "invalid port: $p"
+  [ "$p" -ge "$PORT_LO" ] && [ "$p" -le "$PORT_HI" ] || die "port $p outside $PORT_LO-$PORT_HI" 3
+}
+
+check_heap() {
+  local h="$1"
+  [[ "$h" =~ ^[0-9]+$ ]] || die "invalid heap: $h"
+  [ "$h" -ge "$HEAP_MIN" ] && [ "$h" -le "$HEAP_MAX" ] || die "heap ${h}MB outside $HEAP_MIN-$HEAP_MAX" 3
+}
+
+# The server directory, rebuilt from the two validated names — never from anything we were handed.
+# realpath is the guard: if any component of the chain is a symlink (or contains '..'), the resolved
+# path is somewhere else and the equality fails. -m so it also works before the directory exists.
+server_dir() {
+  local owner="$1" slug="$2" want real rroot
+  want="$ROOT/$owner/$slug"
+  rroot="$(realpath -m -- "$ROOT")"
+  real="$(realpath -m -- "$want")"
+  [ "$real" = "$rroot/$owner/$slug" ] || die "path escapes $ROOT ($want → $real)" 3
+  printf '%s' "$real"
+}
+
+instance() { printf '%s-%s' "$1" "$2"; }
+unit()     { printf '%s@%s.service' "$UNIT_PREFIX" "$(instance "$1" "$2")"; }
+dropin()   { printf '%s/%s@%s.service.d' "$SYSTEMD_DIR" "$UNIT_PREFIX" "$(instance "$1" "$2")"; }
+
+# ── create ────────────────────────────────────────────────────────────────────────────
+# Lays down the tree and the per-instance drop-in. Re-runnable: a half-created server (the jar
+# download died) can be created again, and every mode/owner/ACL is re-asserted, not assumed.
+cmd_create() {
+  local owner="$1" slug="$2" heap="$3" port="$4" rcon="$5"
+  check_owner "$owner"; check_slug "$slug"; check_heap "$heap"
+  check_port "$port"; check_port "$rcon"
+  [ "$port" != "$rcon" ] || die "game and rcon port are the same"
+
+  local dir ru
+  dir="$(server_dir "$owner" "$slug")"
+  ru="$(runuser "$slug")"
+  ensure_runuser "$ru"
+
+  # The roots. Both are owned by the daemon, not by the human: no human account needs to walk this
+  # tree, and one that could would be able to read another server's rcon password.
+  #
+  # servers/<owner> is 0751 — traverse, but NOT list. The run account has to walk THROUGH it to reach
+  # its own world (it is in no group here, so it needs the world-execute bit), while `other` still
+  # cannot enumerate what servers exist. Each server directory below is 2770 and closes the door
+  # properly. 0750 would look tighter and would simply stop every server from booting.
+  install -d -o "$SVC_USER" -g "$SVC_USER" -m 0755 "$ROOT"
+  install -d -o "$SVC_USER" -g "$SVC_USER" -m 0751 "$ROOT/$owner"
+  # setgid: everything created in the tree — by the game (uid hs-<slug>) or by the daemon (uid hosuto)
+  # — lands in group hosuto, so the daemon can always read what the server wrote.
+  install -d -o "$ru" -g "$SVC_USER" -m 2770 "$dir"
+
+  # The default ACL. Without it the daemon's 0640 hosuto:hosuto server.properties is unreadable to
+  # the game that has to boot from it. Fail CLOSED: a tree the server cannot read produces a JVM that
+  # silently starts on default settings (wrong port, no rcon) — far worse than refusing here.
+  command -v setfacl >/dev/null || die "setfacl not found — install the 'acl' package" 4
+  setfacl -m "u:$ru:rwx" -m "d:u:$ru:rwx" -m "d:g:$SVC_USER:rwx" "$dir" \
+    || die "could not set the run-account ACL on $dir (does the filesystem support ACLs?)" 4
+
+  write_dropin "$owner" "$slug" "$dir" "$ru" "$heap" "$port" "$rcon"
+  systemctl daemon-reload
+  printf '%s\n' "$dir"
+}
+
+# The per-instance drop-in: everything the template unit cannot know. It is root-written and
+# root-owned, so nothing the owner can do inside their tree changes how their server is launched.
+write_dropin() {
+  local owner="$1" slug="$2" dir="$3" ru="$4" heap="$5" port="$6" rcon="$7"
+  local d; d="$(dropin "$owner" "$slug")"
+
+  # MemoryMax must cover the JVM, not the heap: metaspace, code cache, GC structures, thread stacks
+  # and direct buffers live OUTSIDE -Xmx. A cgroup limit of exactly Xmx gets the server OOM-killed
+  # mid-world-load, every time. 1.25*Xmx + 512MiB, with a floor of Xmx + 768MiB so small heaps (which
+  # pay the same fixed JVM overhead) are not starved. MemoryHigh sits 256MiB below it: the kernel
+  # throttles and reclaims there first, which turns "killed" into "slow" for a transient spike.
+  local max high floor
+  max=$(( heap * 5 / 4 + 512 ))
+  floor=$(( heap + 768 ))
+  [ "$max" -lt "$floor" ] && max="$floor"
+  high=$(( max - 256 ))
+
+  install -d -o root -g root -m 0755 "$d"
+  cat > "$d/instance.conf" <<EOF
+# Generated by hosuto-server create — do not edit; \`hosuto-server create\` rewrites it.
+# The per-instance half of hosuto-mc@.service: identity, tree and memory. Root-owned, so the
+# owner cannot widen it from inside their own server directory.
+[Service]
+# THE isolation boundary: the server's own dedicated account — no groups, no shell, no home, no
+# secrets. NOT the owner ($owner), who on a real host is in sudo/lxd/holistic; mod code must not
+# inherit any of that. See the header.
+User=$ru
+Group=$ru
+# The tree, handed to ExecStart/ExecStop through the environment (WorkingDirectory= and
+# ReadWritePaths= take no variables, so they are written out here as well).
+Environment=HOSUTO_DIR=$dir
+# ProtectHome=tmpfs empties /home, so \$HOME would not exist; the JVM writes its preferences and
+# hsperfdata relative to it. Point it at the server's own tree.
+Environment=HOME=$dir
+WorkingDirectory=$dir
+# The single writable path under ProtectSystem=strict.
+ReadWritePaths=$dir
+MemoryHigh=${high}M
+MemoryMax=${max}M
+# Recorded for the operator reading \`systemctl cat\`: game $port, rcon $rcon (both loopback-only,
+# via server-ip in server.properties — mc-router is the only way in).
+EOF
+  chmod 0644 "$d/instance.conf"
+}
+
+# ── lifecycle ─────────────────────────────────────────────────────────────────────────
+# A server must be created before it can run: the same two names, re-validated, and a tree that
+# really is there. `systemctl` is only ever handed the unit name we built ourselves.
+require_server() {
+  local owner="$1" slug="$2" dir
+  check_owner "$owner"; check_slug "$slug"
+  dir="$(server_dir "$owner" "$slug")"
+  [ -d "$dir" ] || die "no server $owner/$slug" 5
+  [ -d "$(dropin "$owner" "$slug")" ] || die "server $owner/$slug has no unit drop-in — re-create it" 5
+  printf '%s' "$dir"
+}
+
+cmd_start() {
+  local owner="$1" slug="$2" dir
+  dir="$(require_server "$owner" "$slug")"
+  # exec.argv is written by hosutod after the jar install. Without it the unit would crash-loop with
+  # an unreadable error; say the true thing instead.
+  [ -f "$dir/exec.argv" ] || die "server $owner/$slug is not installed yet (no exec.argv)" 5
+  # A previous crash leaves the unit in `failed`, where start is a no-op until it is reset.
+  systemctl reset-failed "$(unit "$owner" "$slug")" >/dev/null 2>&1 || true
+  systemctl start "$(unit "$owner" "$slug")" || die "could not start $(unit "$owner" "$slug")" 4
+}
+
+cmd_stop() {
+  local owner="$1" slug="$2"
+  require_server "$owner" "$slug" >/dev/null
+  # Slow on purpose: ExecStop takes the world through an RCON /stop and waits for the save.
+  systemctl stop "$(unit "$owner" "$slug")" || die "could not stop $(unit "$owner" "$slug")" 4
+}
+
+cmd_restart() {
+  local owner="$1" slug="$2" dir
+  dir="$(require_server "$owner" "$slug")"
+  [ -f "$dir/exec.argv" ] || die "server $owner/$slug is not installed yet (no exec.argv)" 5
+  systemctl reset-failed "$(unit "$owner" "$slug")" >/dev/null 2>&1 || true
+  systemctl restart "$(unit "$owner" "$slug")" || die "could not restart $(unit "$owner" "$slug")" 4
+}
+
+cmd_status() {
+  local owner="$1" slug="$2" u
+  check_owner "$owner"; check_slug "$slug"
+  u="$(unit "$owner" "$slug")"
+  # is-active exits non-zero for a stopped server, which is not an error for a status query.
+  printf '%s\n' "$(systemctl is-active "$u" 2>/dev/null || true)"
+}
+
+# ── destroy ───────────────────────────────────────────────────────────────────────────
+# Stops the unit, drops the drop-in, and removes ONLY the realpath-verified server directory.
+# Nothing else on the host is ever touched.
+cmd_destroy() {
+  local owner="$1" slug="$2" dir u d
+  check_owner "$owner"; check_slug "$slug"
+  dir="$(server_dir "$owner" "$slug")"
+  u="$(unit "$owner" "$slug")"
+  d="$(dropin "$owner" "$slug")"
+
+  systemctl disable --now "$u" >/dev/null 2>&1 || true
+  systemctl reset-failed "$u" >/dev/null 2>&1 || true
+  rm -rf -- "$d"
+  systemctl daemon-reload
+
+  # The final gate on the only rm -rf in hosuto. server_dir() already refused anything whose realpath
+  # is not exactly $ROOT/<owner>/<slug>; re-assert it here, next to the deletion, and require a real
+  # directory (never a symlink) so the check and the delete cannot drift apart.
+  if [ -n "$dir" ] && [ "$dir" != "/" ] && [ -d "$dir" ] && [ ! -L "$dir" ] \
+     && [ "$dir" = "$(realpath -m -- "$ROOT")/$owner/$slug" ]; then
+    rm -rf -- "$dir"
+  fi
+  # Take the per-owner directory with it when it held nothing else. rmdir refuses a non-empty one,
+  # so another server of theirs is never in danger.
+  rmdir -- "$ROOT/$owner" 2>/dev/null || true
+
+  # The run account dies with the server it was made for. Left behind, it would accumulate one dead
+  # system user per server ever created, and a future server reusing the slug would inherit an
+  # account whose uid may still own files elsewhere. userdel only after the tree is gone, so it can
+  # never orphan files it still owns.
+  local ru; ru="$(runuser "$slug")"
+  if getent passwd "$ru" >/dev/null; then
+    pkill -KILL -u "$ru" 2>/dev/null || true
+    userdel "$ru" 2>/dev/null || true
+    groupdel "$ru" 2>/dev/null || true
+  fi
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────────────
+usage() {
+  cat >&2 <<'EOF'
+usage: hosuto-server create  <owner> <slug> <heapMB> <port> <rconPort>
+       hosuto-server start   <owner> <slug>
+       hosuto-server stop    <owner> <slug>
+       hosuto-server restart <owner> <slug>
+       hosuto-server destroy <owner> <slug>
+       hosuto-server status  <owner> <slug>
+EOF
+  exit 2
+}
+
+verb="${1:-}"; owner="${2:-}"; slug="${3:-}"
+[ -n "$verb" ] && [ -n "$owner" ] && [ -n "$slug" ] || usage
+
+case "$verb" in
+  create)
+    [ $# -eq 6 ] || usage
+    cmd_create "$owner" "$slug" "$4" "$5" "$6"
+    ;;
+  start|stop|restart|destroy|status)
+    [ $# -eq 3 ] || usage
+    "cmd_$verb" "$owner" "$slug"
+    ;;
+  *) usage ;;
+esac

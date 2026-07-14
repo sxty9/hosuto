@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# hosuto-stop <serverdir> [mainpid] — the ExecStop of hosuto-mc@.service: ask the Minecraft server to
+# save its world and shut itself down, over RCON, and wait for it to finish.
+#
+# WHY THIS EXISTS. A Minecraft server holds the world in memory and writes it back on shutdown. The
+# graceful path is the `/stop` command; the JVM's SIGTERM shutdown hook is a backstop that vanilla
+# does install, but a hook has no ordering guarantees against a save that is already in flight, and
+# nothing at all guarantees it on a modded server. So hosuto asks first, and lets systemd's SIGTERM
+# (sent the moment this script returns) be what it should be: the fallback.
+#
+# WHY THE RETRY. hosuto-mc@.service is Type=simple, so systemd calls the unit ACTIVE at fork() —
+# while the JVM is still loading chunks, 60-120 seconds before RCON's listener even binds. A stop
+# issued in that window finds nothing listening. Giving up there would SIGTERM a half-loaded world,
+# which is precisely the case a Minecraft server survives worst. So this retries until RCON answers.
+#
+# WHY IT NEVER FAILS. A non-zero ExecStop marks the unit `failed` — a perfectly normal `systemctl
+# stop` would end up looking like a crash in the UI. Every path here exits 0 and says what happened
+# on stderr (the journal); systemd's SIGTERM then does the rest.
+#
+# Installed root:root 0755 at /usr/local/sbin/hosuto-stop. Runs as the OWNER when systemd invokes it
+# (it inherits User= from the unit); hosutod may also invoke it through `sudo -n`. It needs no
+# privilege either way — it opens a loopback socket and waits.
+set -euo pipefail
+
+ROOT=/var/lib/hosuto/servers
+# Budgets. Their sum stays well under the unit's TimeoutStopSec=300, so systemd's SIGKILL is never
+# what ends a save that was still running.
+RCON_DEADLINE="${HOSUTO_STOP_RCON_DEADLINE:-120}"   # keep asking until RCON is up
+EXIT_DEADLINE="${HOSUTO_STOP_EXIT_DEADLINE:-240}"   # total: /stop issued, world saved, JVM gone
+RETRY_SLEEP=2
+
+warn() { printf 'hosuto-stop: %s\n' "$1" >&2; }
+give_up() { warn "$1 — leaving the shutdown to SIGTERM"; exit 0; }
+
+dir="${1:-}"
+pid="${2:-}"   # systemd expands $MAINPID; empty is normal (no main process, or an early stop)
+[ -n "$dir" ] || give_up "no server directory given"
+
+real="$(realpath -e -- "$dir" 2>/dev/null || true)"
+[ -n "$real" ] || give_up "no such server directory: $dir"
+rroot="$(realpath -m -- "$ROOT")"
+[[ "$real" =~ ^"$rroot"/[^/]+/[^/]+$ ]] || give_up "server directory escapes $ROOT: $real"
+
+# Nothing to stop: the JVM is already gone (a crash, or a race with systemd).
+alive() { [ -n "$pid" ] && [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; }
+[ -n "$pid" ] && ! alive && exit 0
+
+# ── rcon credentials, straight out of the file the server itself reads ────────────────
+# hosutod owns these keys (runtime.writeProps). Parsed as data: no eval, no sourcing — server.properties
+# is a file the server process can also rewrite, and it runs as a human we do not trust with root.
+props="$real/server.properties"
+[ -r "$props" ] || give_up "cannot read $props"
+
+port=""; pass=""
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    'rcon.port='*)     port="${line#rcon.port=}" ;;
+    'rcon.password='*) pass="${line#rcon.password=}" ;;
+  esac
+done < "$props"
+[[ "$port" =~ ^[0-9]+$ ]] || give_up "no rcon.port in server.properties"
+[ -n "$pass" ] || give_up "no rcon.password in server.properties"
+
+# ── the RCON /stop ────────────────────────────────────────────────────────────────────
+# python3 is the landscape's only assumed interpreter, and the protocol is 30 lines of struct: a
+# little-endian length, a request id, a type (3 = auth, 2 = command), a NUL-terminated body, a NUL
+# pad. Auth failure comes back as id == -1, which is the one error worth distinguishing (retrying it
+# is pointless). The password travels in the ENVIRONMENT, never in argv — /proc/<pid>/cmdline is
+# world-readable and /proc/<pid>/environ is not.
+rcon_stop() {
+  HOSUTO_RCON_PASS="$pass" python3 - "$port" <<'PY'
+import os, socket, struct, sys
+
+port = int(sys.argv[1])
+password = os.environ["HOSUTO_RCON_PASS"]
+
+AUTH, AUTH_RESPONSE, COMMAND = 3, 2, 2
+
+
+def send(sock, ident, kind, body):
+    payload = struct.pack("<ii", ident, kind) + body.encode("utf-8") + b"\x00\x00"
+    sock.sendall(struct.pack("<i", len(payload)) + payload)
+
+
+def recv_exactly(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("rcon closed the connection")
+        buf += chunk
+    return buf
+
+
+def read_packet(sock):
+    (length,) = struct.unpack("<i", recv_exactly(sock, 4))
+    # 10 = the two ints plus the two NULs; the cap keeps a hostile length off the heap.
+    if length < 10 or length > 65536:
+        raise ValueError("rcon framing error (length %d)" % length)
+    payload = recv_exactly(sock, length)
+    ident, kind = struct.unpack("<ii", payload[:8])
+    return ident, kind, payload[8:-2].decode("utf-8", "replace")
+
+
+try:
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+except OSError as err:
+    # The listener is not up yet — the world is still loading. The caller retries.
+    print("rcon connect: %s" % err, file=sys.stderr)
+    sys.exit(1)
+
+with sock:
+    sock.settimeout(5)
+    try:
+        send(sock, 1, AUTH, password)
+        # Some implementations precede the auth response with an empty value packet; skip to it.
+        while True:
+            ident, kind, _ = read_packet(sock)
+            if kind == AUTH_RESPONSE:
+                break
+        if ident == -1:
+            print("rcon auth rejected", file=sys.stderr)
+            sys.exit(2)  # a wrong password will not become right on the next try
+        send(sock, 2, COMMAND, "stop")
+        read_packet(sock)  # the server acknowledges before it begins the save
+    except (OSError, EOFError, ValueError) as err:
+        print("rcon: %s" % err, file=sys.stderr)
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# The rcon port stops accepting once the server closes its listener — the exit signal we have when
+# systemd gave us no $MAINPID.
+rcon_listening() {
+  python3 - "$port" <<'PY' 2>/dev/null
+import socket, sys
+try:
+    socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2).close()
+except OSError:
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+SECONDS=0
+stopped=0
+while [ "$SECONDS" -lt "$RCON_DEADLINE" ]; do
+  # The server may also have died on its own while we were waiting for it to come up.
+  [ -n "$pid" ] && ! alive && exit 0
+  set +e
+  rcon_stop
+  rc=$?
+  set -e
+  case "$rc" in
+    0) stopped=1; break ;;
+    2) give_up "rcon rejected hosuto's password" ;;   # the files disagree; SIGTERM is all that is left
+    *) sleep "$RETRY_SLEEP" ;;
+  esac
+done
+[ "$stopped" = 1 ] || give_up "rcon never came up within ${RCON_DEADLINE}s"
+
+# ── wait for the save ─────────────────────────────────────────────────────────────────
+# systemd sends SIGTERM the moment this returns, so returning early is the one thing that would undo
+# the graceful stop we just asked for.
+while [ "$SECONDS" -lt "$EXIT_DEADLINE" ]; do
+  if [ -n "$pid" ]; then
+    alive || exit 0
+  else
+    rcon_listening || exit 0
+  fi
+  sleep 1
+done
+warn "server still running ${EXIT_DEADLINE}s after /stop — leaving the rest to SIGTERM"
+exit 0
