@@ -394,10 +394,15 @@ function CreateServerModal({
       .catch(() => setReleases([]));
   }, [api]);
 
-  // An empty version means "the newest", which the daemon resolves itself — so the newest release
-  // is only ever a placeholder here, never a value we invent and send.
   const latest = releases[0] ?? '';
   const mc = mcVersion.trim() || latest;
+
+  // Pre-fill the newest release once the catalogue loads, so the field shows the value that will
+  // actually be used instead of a gray hint the user has to trust is adopted. Only an untouched
+  // field is filled — once they type, their choice stands.
+  useEffect(() => {
+    if (!mcVersion && releases.length > 0) setMcVersion(releases[0]);
+  }, [releases, mcVersion]);
 
   useEffect(() => {
     if (loader === 'vanilla' || !mc) {
@@ -416,6 +421,15 @@ function CreateServerModal({
       live = false;
     };
   }, [api, loader, mc]);
+
+  // Same pre-fill for the loader build. The list reloads on every loader/version change (and the
+  // loader switch clears the field, below), so this re-fills the newest build for each combination —
+  // and the value shown is the value sent.
+  useEffect(() => {
+    if (loader !== 'vanilla' && !loaderVersion && loaderVersions.length > 0) {
+      setLoaderVersion(loaderVersions[0]);
+    }
+  }, [loaderVersions, loader, loaderVersion]);
 
   // Mod loaders lag weeks behind a Minecraft release, so "newest Minecraft + NeoForge" — the most
   // natural thing to pick, and what this form defaults to — often has no builds at all. Say so at the
