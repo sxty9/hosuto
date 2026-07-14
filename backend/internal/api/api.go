@@ -36,6 +36,7 @@ import (
 	"hosuto/internal/notify"
 	"hosuto/internal/rights"
 	"hosuto/internal/runtime"
+	"hosuto/internal/skin"
 	"hosuto/internal/store"
 	"hosuto/internal/versions"
 )
@@ -58,15 +59,16 @@ type Server struct {
 	mc   *mcapi.Client
 	mr   *modrinth.Client
 	vc   *versions.Client
+	skin *skin.Renderer
 	http *http.Client
 }
 
 // New wires the HTTP layer.
 func New(v *auth.Verifier, st *store.Store, cfg *hconfig.Config, rt *runtime.Manager,
 	dir *directory.Directory, cx *contax.Client, nt *notify.Client, mc *mcapi.Client,
-	mr *modrinth.Client, vc *versions.Client) *Server {
+	mr *modrinth.Client, vc *versions.Client, sk *skin.Renderer) *Server {
 	return &Server{v: v, st: st, cfg: cfg, rt: rt, dir: dir, cx: cx, nt: nt, mc: mc, mr: mr, vc: vc,
-		http: &http.Client{Timeout: 60 * time.Second}}
+		skin: sk, http: &http.Client{Timeout: 60 * time.Second}}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -85,6 +87,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"account", s.guard(rights.GroupPlay, false, s.getAccount))
 	mux.HandleFunc("PUT "+base+"account", s.guard(rights.GroupPlay, true, s.linkAccount))
 	mux.HandleFunc("DELETE "+base+"account", s.guard(rights.GroupPlay, true, s.unlinkAccount))
+
+	// A member's face, rendered from their Minecraft skin. hosuto owns the account mapping, so hosuto
+	// is the only service that can serve this.
+	mux.HandleFunc("GET "+base+"avatar/{user}", s.guard(rights.GroupPlay, false, s.avatar))
 
 	mux.HandleFunc("GET "+base+"servers", s.guard(rights.GroupPlay, false, s.listServers))
 	mux.HandleFunc("POST "+base+"servers", s.guard(rights.GroupHost, true, s.createServer))
@@ -213,6 +219,35 @@ func (s *Server) resyncFor(ctx context.Context, user string) {
 	}
 }
 
+// avatar serves a member's Minecraft face as a PNG.
+//
+// The path carries a Linux username, not a UUID: the UUID is hosuto's to know, and putting it in a
+// URL the browser holds would leak every member's Mojang identity into logs and history for no gain.
+//
+// A member with no linked account, or one whose profile has no skin, gets a 404 — and the SDK's
+// <Avatar> falls back to their initials on an image error. That fallback is the honest outcome: a
+// made-up Steve face would claim a skin they do not have.
+func (s *Server) avatar(w http.ResponseWriter, r *http.Request, _ *auth.User) {
+	user := strings.TrimSuffix(r.PathValue("user"), ".png")
+	acc, ok := s.st.Account(user)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No linked account")
+		return
+	}
+	size, _ := strconv.Atoi(r.URL.Query().Get("size"))
+	png, err := s.skin.Face(r.Context(), acc.UUID, size)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "No skin")
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	// The face is derived from a skin the member can change at will, but it changes rarely. An hour of
+	// browser cache keeps a member list from re-fetching a dozen PNGs on every render, while a skin
+	// change still lands the same day. The renderer holds its own six-hour cache behind this.
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	_, _ = w.Write(png)
+}
+
 // ── servers ───────────────────────────────────────────────────────────────────────────
 
 // view is a server as the UI sees it, with the caller's relationship to it attached.
@@ -289,6 +324,10 @@ func (s *Server) createServer(w http.ResponseWriter, r *http.Request, u *auth.Us
 		writeErr(w, http.StatusConflict, "That address is already taken")
 		return
 	}
+	if err := s.supported(r.Context(), body.Loader, body.MCVersion); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	// The per-user cap is not a nicety: each server is gigabytes of heap on a box that also runs the
 	// rest of the landscape. devlab caps previews for exactly this reason.
 	max := s.cfg.Int("maxServersPerUser", 3)
@@ -343,6 +382,39 @@ func (s *Server) createServer(w http.ResponseWriter, r *http.Request, u *auth.Us
 		return
 	}
 	writeJSON(w, http.StatusOK, redact(srv))
+}
+
+// supported reports whether a loader actually has a build for a Minecraft version.
+//
+// It exists because the failure without it is awful: mod loaders lag behind Minecraft by weeks, so
+// "newest Minecraft + NeoForge" — the most natural thing to pick, and the default the form offers —
+// silently has no builds at all. The version list simply comes back empty, hosuto happily creates the
+// server, and it dies minutes later on a 404 while downloading an installer that was never published.
+// Paper is worse: its API answers 410 Gone for a version it does not know.
+//
+// So ask BEFORE committing anything, and say the true thing.
+func (s *Server) supported(ctx context.Context, loader, mcVersion string) error {
+	if loader == "vanilla" {
+		return nil // every Minecraft version has a vanilla server by definition
+	}
+	vs, err := s.vc.LoaderVersions(ctx, loader, mcVersion)
+	if err != nil || len(vs) == 0 {
+		return fmt.Errorf("%s has no build for Minecraft %s yet — pick an older Minecraft version, or a different loader",
+			loaderName(loader), mcVersion)
+	}
+	return nil
+}
+
+func loaderName(l string) string {
+	switch l {
+	case "fabric":
+		return "Fabric"
+	case "neoforge":
+		return "NeoForge"
+	case "paper":
+		return "Paper"
+	}
+	return l
 }
 
 // owned resolves the server and checks the caller may CONTROL it (owner or admin).
@@ -843,6 +915,14 @@ func (s *Server) setVersion(w http.ResponseWriter, r *http.Request, u *auth.User
 	}
 	ctx := r.Context()
 	dir := runtime.Dir(srv.Owner, srv.Slug)
+
+	// Refuse a combination that has no builds BEFORE touching the installed server. Without this, a
+	// version change to "newest Minecraft + NeoForge" would delete the working jar, fail to fetch a
+	// replacement that does not exist, and leave the server unbootable.
+	if err := s.supported(ctx, body.Loader, body.MCVersion); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	argv, err := s.vc.Install(ctx, dir, body.Loader, body.MCVersion, body.LoaderVersion, srv.HeapMB)
 	if err != nil {

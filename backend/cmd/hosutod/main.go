@@ -27,6 +27,7 @@ import (
 	"hosuto/internal/notify"
 	"hosuto/internal/router"
 	"hosuto/internal/runtime"
+	"hosuto/internal/skin"
 	"hosuto/internal/store"
 	"hosuto/internal/versions"
 )
@@ -87,6 +88,7 @@ func main() {
 	mc := mcapi.New("", nil)
 	mr := modrinth.New("", cfg.String("modrinthUserAgent", "sxty9/hosuto (holistic)"), nil)
 	vc := versions.New(nil)
+	sk := skin.New("", nil)
 	mgr := runtime.New(st, cfg, rt, vc)
 
 	// Reconcile mc-router's live route table with the servers hosuto actually has. A crash between
@@ -100,7 +102,7 @@ func main() {
 	cancel()
 
 	srv := &http.Server{
-		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc).Handler(),
+		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	// Bind synchronously so "address already in use" surfaces here, not inside a goroutine.

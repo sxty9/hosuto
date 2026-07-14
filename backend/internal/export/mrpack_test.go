@@ -182,7 +182,7 @@ func TestWriteMrpackOverrides(t *testing.T) {
 
 	// The preset connection, at the .minecraft root that overrides/ is.
 	var dat bytes.Buffer
-	if err := WriteServersDat(&dat, "Creative Sandbox", "creative.example.org:25566"); err != nil {
+	if err := WriteServersDat(&dat, "Creative Sandbox", "creative.example.org"); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(entries["overrides/servers.dat"], dat.Bytes()) {

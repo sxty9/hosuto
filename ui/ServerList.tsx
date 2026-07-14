@@ -44,6 +44,7 @@ import {
   type ServerView,
   type ServersResp,
 } from './types';
+import { faceUrl } from './face';
 
 const HOST = 'hp_hosuto_host';
 const PLAY = 'hp_hosuto_play';
@@ -215,7 +216,7 @@ function AccountPanel({
   if (account) {
     return (
       <Stack direction="row" align="center" gap={2}>
-        <Avatar name={account.name} size={24} />
+        <Avatar name={account.name} src={faceUrl(api, account.user, 48)} size={24} />
         <Text variant="footnote" color="secondary">
           {account.name}
         </Text>
@@ -381,6 +382,7 @@ function CreateServerModal({
   const [zone, setZone] = useState('');
   const [releases, setReleases] = useState<string[]>([]);
   const [loaderVersions, setLoaderVersions] = useState<string[]>([]);
+  const [loadersLoading, setLoadersLoading] = useState(false);
 
   // The catalogue is the daemon's, not ours: versions come from Mojang's manifest and loader
   // builds from each loader's own index, both proxied and cached by the backend.
@@ -400,17 +402,26 @@ function CreateServerModal({
   useEffect(() => {
     if (loader === 'vanilla' || !mc) {
       setLoaderVersions([]);
+      setLoadersLoading(false);
       return;
     }
     let live = true;
+    setLoadersLoading(true);
     api
       .get<CatalogLoadersResp>(`catalog/loaders?loader=${encodeURIComponent(loader)}&mcVersion=${encodeURIComponent(mc)}`)
       .then((r) => live && setLoaderVersions(r.versions ?? []))
-      .catch(() => live && setLoaderVersions([]));
+      .catch(() => live && setLoaderVersions([]))
+      .finally(() => live && setLoadersLoading(false));
     return () => {
       live = false;
     };
   }, [api, loader, mc]);
+
+  // Mod loaders lag weeks behind a Minecraft release, so "newest Minecraft + NeoForge" — the most
+  // natural thing to pick, and what this form defaults to — often has no builds at all. Say so at the
+  // field instead of letting the user press Create and collect a failure. The daemon refuses the same
+  // combination anyway; this only saves them the round trip.
+  const unsupported = loader !== 'vanilla' && !!mc && !loadersLoading && loaderVersions.length === 0;
 
   const searchVersions = useCallback(
     async (q: string): Promise<AutocompleteOption[]> =>
@@ -467,7 +478,7 @@ function CreateServerModal({
           <Button variant="ghost" onClick={onClose} disabled={busy}>
             {t('hosuto.cancel')}
           </Button>
-          <Button variant="primary" onClick={create} loading={busy}>
+          <Button variant="primary" onClick={create} loading={busy} disabled={unsupported}>
             {t('hosuto.create')}
           </Button>
         </Stack>
@@ -516,7 +527,10 @@ function CreateServerModal({
         </Field>
 
         {loader !== 'vanilla' && (
-          <Field label={t('hosuto.loaderVersion')}>
+          <Field
+            label={t('hosuto.loaderVersion')}
+            error={unsupported ? t('hosuto.loaderUnsupported', { loader, mc }) : undefined}
+          >
             <Autocomplete
               value={loaderVersion}
               onChange={setLoaderVersion}

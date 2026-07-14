@@ -33,6 +33,7 @@ import {
   type ServiceContextProps,
 } from '@holistic/ui';
 import type { Grant, JoinPolicy, Level, MembersResp, PolicyResp, ServerView } from './types';
+import { faceUrl } from './face';
 
 interface PickedGroup {
   id: string;
@@ -144,7 +145,11 @@ export function Players({
             {players.map((p) => (
               <Stack key={p.user} direction="row" align="center" justify="between" gap={2}>
                 <Stack direction="row" align="center" gap={2}>
-                  <Avatar name={p.name || p.user} size={28} />
+                  <Avatar
+                    name={p.name || p.user}
+                    src={p.hasAccount ? faceUrl(api, p.user, 56) : undefined}
+                    size={28}
+                  />
                   <Stack gap={0}>
                     <Text>{p.name || p.user}</Text>
                     {!p.hasAccount && (

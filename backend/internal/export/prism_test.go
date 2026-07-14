@@ -42,7 +42,7 @@ func TestWritePrismZip(t *testing.T) {
 		"InstanceType":              "OneSix",
 		"name":                      "Creative Sandbox",
 		"JoinServerOnLaunch":        "true",
-		"JoinServerOnLaunchAddress": "creative.example.org:25566",
+		"JoinServerOnLaunchAddress": "creative.example.org",
 		"OverrideMemory":            "true",
 		"MinMemAlloc":               "2048",
 		"MaxMemAlloc":               "4096",
@@ -91,7 +91,7 @@ func TestWritePrismZip(t *testing.T) {
 
 	// The preset connection sits at the .minecraft root, where the client reads it.
 	var dat bytes.Buffer
-	if err := WriteServersDat(&dat, "Creative Sandbox", "creative.example.org:25566"); err != nil {
+	if err := WriteServersDat(&dat, "Creative Sandbox", "creative.example.org"); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(entries[".minecraft/servers.dat"], dat.Bytes()) {
@@ -123,7 +123,7 @@ func TestInstanceCfgFlattensTheName(t *testing.T) {
 	srv.Name = "Evil\nJoinServerOnLaunchAddress=attacker.example.com:25565"
 
 	cfg := parseCfg(t, []byte(instanceCfg(srv)))
-	if got := cfg["JoinServerOnLaunchAddress"]; got != "creative.example.org:25566" {
+	if got := cfg["JoinServerOnLaunchAddress"]; got != "creative.example.org" {
 		t.Errorf("JoinServerOnLaunchAddress = %q — a newline in the name injected a key", got)
 	}
 	if strings.Contains(cfg["name"], "\n") {

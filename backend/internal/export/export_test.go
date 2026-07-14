@@ -119,9 +119,16 @@ func readZip(t *testing.T, b []byte) map[string][]byte {
 }
 
 func TestJoinAddress(t *testing.T) {
-	srv := testServer()
-	if got, want := JoinAddress(srv), "creative.example.org:25566"; got != want {
-		t.Errorf("JoinAddress = %q, want %q", got, want)
+	// The player-facing address is the HOSTNAME ALONE. srv.Port is the loopback port the JVM binds
+	// (server-ip=127.0.0.1); nothing outside this machine can dial it. Players reach mc-router on the
+	// default 25565 and it splices them to that backend by the hostname in their handshake.
+	//
+	// This test exists because the opposite — emitting Host:Port — is the plausible-looking bug: the
+	// exported bundle is perfectly well-formed and simply points at an address that can never answer,
+	// so the one-click join fails at the player's end with nothing to debug.
+	srv := store.Server{Host: "creative.example.org", Port: 25566}
+	if got, want := JoinAddress(srv), "creative.example.org"; got != want {
+		t.Errorf("JoinAddress = %q, want %q — the internal backend port must never reach a client", got, want)
 	}
 	srv.Port = 0
 	if got, want := JoinAddress(srv), "creative.example.org"; got != want {

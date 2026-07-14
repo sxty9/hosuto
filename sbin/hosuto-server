@@ -89,6 +89,30 @@ check_slug() {
 # The server's own account: hs-<slug>. Derived from the validated slug alone, never passed in.
 runuser() { printf 'hs-%s' "$1"; }
 
+# passwd_retry runs a user-database command, waiting out the /etc/passwd lock.
+#
+# useradd/userdel take an exclusive lock on the shadow suite and FAIL OUTRIGHT — "cannot lock
+# /etc/passwd; try again later" — rather than blocking, if anyone else holds it. On a real host that
+# is not rare: unattended-upgrades running apt, `./service setup` doing its own usermod, or simply two
+# members creating a server at the same second. Without this, one of them just loses, and the user
+# sees "could not create the run account" for a problem that fixes itself in half a second.
+passwd_retry() {
+  local i out
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if out="$("$@" 2>&1)"; then
+      return 0
+    fi
+    # Only the lock is worth retrying. A real error (name taken, bad argument) must fail immediately
+    # rather than being hidden behind six seconds of pointless waiting.
+    case "$out" in
+      *"cannot lock"*|*"try again later"*|*"Try again later"*) sleep 0.5 ;;
+      *) printf '%s\n' "$out" >&2; return 1 ;;
+    esac
+  done
+  printf '%s\n' "$out" >&2
+  return 1
+}
+
 # ensure_runuser creates the locked-down system account the JVM runs as. Idempotent.
 #
 # --system (uid < 1000, so it can never be a holistic member), no home, nologin shell, and a private
@@ -97,7 +121,7 @@ runuser() { printf 'hs-%s' "$1"; }
 ensure_runuser() {
   local ru="$1"
   if ! getent passwd "$ru" >/dev/null; then
-    useradd --system --no-create-home --home-dir /nonexistent \
+    passwd_retry useradd --system --no-create-home --home-dir /nonexistent \
             --shell /usr/sbin/nologin --user-group "$ru" \
       || die "could not create the run account $ru" 4
     passwd -l "$ru" >/dev/null 2>&1 || true
@@ -307,8 +331,10 @@ cmd_destroy() {
   local ru; ru="$(runuser "$slug")"
   if getent passwd "$ru" >/dev/null; then
     pkill -KILL -u "$ru" 2>/dev/null || true
-    userdel "$ru" 2>/dev/null || true
-    groupdel "$ru" 2>/dev/null || true
+    # Same lock contention as on create — and here losing the race would leave a dead account behind
+    # that a future server with the same slug would inherit.
+    passwd_retry userdel "$ru" >/dev/null 2>&1 || true
+    passwd_retry groupdel "$ru" >/dev/null 2>&1 || true
   fi
 }
 

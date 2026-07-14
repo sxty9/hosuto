@@ -30,11 +30,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"hosuto/internal/store"
@@ -91,16 +89,20 @@ func checkClientExport(srv store.Server) error {
 // .mrpack's servers.dat, the Prism instance's servers.dat and Prism's JoinServerOnLaunchAddress all
 // read it from here, so the three cannot drift apart.
 //
-// It is Host:Port. NOTE for the API layer: if hosuto fronts its servers with mc-router (the
-// routerApi config knob says it does), then the player-facing endpoint is the ROUTER — it reads the
-// hostname out of the client's handshake and proxies to the backend port, which is not reachable
-// from outside at all. In that deployment this must return Host alone, i.e. the default 25565, and
-// srv.Port is an internal detail no client should ever see. Either way it is one line, here.
+// It is the HOSTNAME ALONE — never Host:Port.
+//
+// srv.Port is the loopback port the JVM binds (server-ip=127.0.0.1); it is not reachable from
+// anywhere but this machine, and it is never what a player dials. Players reach mc-router on the
+// default 25565, which reads the hostname out of their handshake and splices them to that backend.
+// Emitting Host:Port here would put an unreachable address into every exported bundle and break the
+// one-click join that is the whole point of the Prism export — silently, because the file looks
+// perfectly well-formed.
+//
+// Omitting the port is also what keeps the SRV trap shut: a client that is given a bare hostname on
+// the default port never needs an SRV record, and an SRV record would REPLACE the hostname in the
+// handshake with its target — collapsing every server onto one backend.
 func JoinAddress(srv store.Server) string {
-	if srv.Port == 0 {
-		return srv.Host
-	}
-	return net.JoinHostPort(srv.Host, strconv.Itoa(srv.Port))
+	return srv.Host
 }
 
 // packName is what the player sees — in their launcher's instance list and in their server list.
