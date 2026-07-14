@@ -20,6 +20,12 @@
           "default": "http://127.0.0.1:25580"
         },
         {
+          "id": "defaultServer",
+          "label": "Fallback server (address)",
+          "type": "string",
+          "default": ""
+        },
+        {
           "id": "portLo",
           "label": "Game port pool — first",
           "type": "int",

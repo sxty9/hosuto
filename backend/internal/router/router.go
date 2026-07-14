@@ -19,11 +19,21 @@
 // route deleted from the file under a watcher would therefore keep being served — a deleted server
 // would stay reachable. Writing through the API instead makes deletion actually delete.
 //
-// # No default route
+// # The default route is OFF unless an admin asks for it
 //
-// hosuto never sets POST /defaultRoute. An unknown host must be refused, not silently spliced into
-// whichever server happens to be the fallback: a stranger who guesses a hostname would otherwise
-// land on a member's server.
+// By default hosuto sets no default route: an unknown hostname is REFUSED, not silently spliced into
+// whichever server happens to be the fallback — a stranger guessing a hostname would otherwise land
+// on a member's world.
+//
+// The one deployment that needs it is a host with no port forward, reached through a tunnel
+// (playit.gg and friends). Such a tunnel terminates the connection under ITS OWN hostname, so the
+// handshake never carries our domain and mc-router has nothing to match on. A fallback server is
+// then the only way anyone reaches anything — and it is only safe because that deployment has one
+// server to reach.
+//
+// It is therefore an explicit admin setting (`defaultServer` in the central Configuration tab), not
+// a default. Turning it on where several members host servers would hand every stray connection to
+// whoever is named in it.
 //
 // # No authentication
 //
@@ -270,4 +280,34 @@ func sorted(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// SetDefault points mc-router's fallback at a backend — every connection whose handshake hostname
+// matches no route lands there. An empty backend clears it.
+//
+// Verified against a live mc-router v1.44: POST /defaultRoute takes {"backend": "..."}, persists it
+// into the routes file as "default-server", and an EMPTY backend is how you remove it. There is no
+// DELETE (it answers 405), which is the sort of thing worth writing down rather than rediscovering.
+func (c *Client) SetDefault(ctx context.Context, backend string) error {
+	if !c.Enabled() {
+		return nil
+	}
+	body, err := json.Marshal(map[string]string{"backend": backend})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/defaultRoute", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer drain(resp)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("router: POST /defaultRoute: status %d", resp.StatusCode)
+	}
+	return nil
 }

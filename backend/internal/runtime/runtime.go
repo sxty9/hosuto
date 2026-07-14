@@ -237,7 +237,40 @@ func (m *Manager) SyncRoutes(ctx context.Context) error {
 	for _, srv := range m.st.Servers() {
 		want[srv.Host] = "127.0.0.1:" + strconv.Itoa(srv.Port)
 	}
-	return m.rt.Sync(ctx, want)
+	if err := m.rt.Sync(ctx, want); err != nil {
+		return err
+	}
+	return m.SyncDefault(ctx)
+}
+
+// SyncDefault points mc-router's fallback at the server named by the `defaultServer` config setting
+// (a slug), or clears it when the setting is empty.
+//
+// Why it exists: a host with no port forward is reached through a tunnel (playit.gg and the like),
+// and such a tunnel presents the connection under ITS OWN hostname. Our domain never appears in the
+// handshake, so mc-router has nothing to match and refuses everything. A fallback is then the only
+// way anyone connects at all.
+//
+// It is deliberately an explicit admin choice and not a default: on a host where several members
+// have servers, a fallback hands every stray or guessed connection to whoever is named in it. It is
+// safe exactly where it is needed — a host with one server — and unsafe everywhere else, which is
+// why hosuto will not infer it.
+func (m *Manager) SyncDefault(ctx context.Context) error {
+	if !m.rt.Enabled() {
+		return nil
+	}
+	slug := strings.TrimSpace(m.cfg.String("defaultServer", ""))
+	if slug == "" {
+		return m.rt.SetDefault(ctx, "")
+	}
+	for _, srv := range m.st.Servers() {
+		if srv.Slug == slug {
+			return m.rt.SetDefault(ctx, "127.0.0.1:"+strconv.Itoa(srv.Port))
+		}
+	}
+	// The setting names a server that does not exist (a typo, or one that was deleted). Clearing is
+	// the safe reading: better that nobody reaches anything than that everybody reaches the wrong one.
+	return m.rt.SetDefault(ctx, "")
 }
 
 // Start/Stop/Restart drive the unit through the wrapper.

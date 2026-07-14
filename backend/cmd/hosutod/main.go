@@ -101,6 +101,21 @@ func main() {
 	}
 	cancel()
 
+	// The `defaultServer` setting is edited in the dashboard's Configuration tab, and hosuto reads its
+	// config live — but mc-router's fallback is state we PUSH, not state it reads. Without this ticker
+	// an admin's change would sit there doing nothing until the next daemon restart, which is exactly
+	// the kind of "I changed it and nothing happened" that makes a config surface untrustworthy.
+	// A loopback POST every half minute costs nothing.
+	go func() {
+		for range time.Tick(30 * time.Second) {
+			c, done := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := mgr.SyncDefault(c); err != nil {
+				log.Printf("hosutod: default route: %v", err)
+			}
+			done()
+		}
+	}()
+
 	srv := &http.Server{
 		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
