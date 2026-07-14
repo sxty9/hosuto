@@ -93,21 +93,30 @@ runuser() { printf 'hs-%s' "$1"; }
 #
 # useradd/userdel take an exclusive lock on the shadow suite and FAIL OUTRIGHT — "cannot lock
 # /etc/passwd; try again later" — rather than blocking, if anyone else holds it. On a real host that
-# is not rare: unattended-upgrades running apt, `./service setup` doing its own usermod, or simply two
-# members creating a server at the same second. Without this, one of them just loses, and the user
-# sees "could not create the run account" for a problem that fixes itself in half a second.
+# is not rare: unattended-upgrades running apt at night (a package's postinst does its own useradd
+# and can hold the lock for the length of the dpkg transaction), `./service setup` doing usermod, or
+# two members creating a server the same second. Without patience here, a member who clicks Create
+# during the nightly upgrade window just gets "could not create the run account" for a problem that
+# clears itself a moment later.
+#
+# So retry generously — up to ~40s. A createServer request blocks on this, but a spinner that
+# resolves beats a spurious failure, and useradd normally returns instantly (the whole loop is a
+# no-op unless a lock is actually contended). Only the lock is retried; a real error (name taken,
+# bad argument) fails immediately rather than hiding behind 40s of pointless waiting.
 passwd_retry() {
-  local i out
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  local i=0 out
+  while :; do
     if out="$("$@" 2>&1)"; then
       return 0
     fi
-    # Only the lock is worth retrying. A real error (name taken, bad argument) must fail immediately
-    # rather than being hidden behind six seconds of pointless waiting.
     case "$out" in
-      *"cannot lock"*|*"try again later"*|*"Try again later"*) sleep 0.5 ;;
+      *"cannot lock"*|*"try again later"*|*"Try again later"*) : ;;
       *) printf '%s\n' "$out" >&2; return 1 ;;
     esac
+    i=$((i + 1))
+    [ "$i" -ge 40 ] && break
+    [ "$i" = 1 ] && printf 'hosuto-server: /etc/passwd is locked (apt/unattended-upgrades?) — waiting...\n' >&2
+    sleep 1
   done
   printf '%s\n' "$out" >&2
   return 1
