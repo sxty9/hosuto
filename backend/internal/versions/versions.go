@@ -42,6 +42,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -340,30 +341,50 @@ func javaMajorFallback(mcVersion string) int {
 // which land under /usr/lib/jvm. The exact Debian path is arch-suffixed, so try that first, then
 // glob for any arch, and only then fall back to whatever `java` is on PATH — that last step is a
 // guess (PATH java may be the wrong major), so it is deliberately last.
-func JavaBin(major int) (string, error) {
-	if p, err := javaBinIn(systemJVMDir, major); err == nil {
-		return p, nil
-	}
-	if p, err := exec.LookPath("java"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("%w: java %d (install openjdk-%d-jre-headless)", ErrNoJava, major, major)
+func JavaBin(needed int) (string, error) {
+	return javaBinIn(systemJVMDir, needed)
 }
 
+// javaDirRe matches the canonical Debian JDK directory and captures its major: "java-21-openjdk-amd64"
+// -> 21. It deliberately does NOT match the dotted legacy alias "java-1.21.0-openjdk-amd64" (a symlink
+// to the same JDK), so each JDK is counted once, by its clean major.
+var javaDirRe = regexp.MustCompile(`^java-([0-9]+)-openjdk-`)
+
 // javaBinIn is JavaBin's filesystem half, rooted so tests can point it at a fixture tree.
-func javaBinIn(root string, major int) (string, error) {
-	exact := filepath.Join(root, fmt.Sprintf("java-%d-openjdk-amd64", major), "bin", "java")
-	if executable(exact) {
-		return exact, nil
-	}
-	// Glob output is sorted, so the choice is deterministic on a host with several arches.
-	matches, _ := filepath.Glob(filepath.Join(root, fmt.Sprintf("java-%d-openjdk-*", major), "bin", "java"))
-	for _, m := range matches {
-		if executable(m) {
-			return m, nil
+//
+// It returns the SMALLEST installed JDK whose major is >= needed. Newer Java runs a modern Minecraft
+// fine, so requiring the exact major would reject a perfectly good runtime; preferring the closest
+// keeps an old version off a needlessly new one.
+//
+// Crucially it does NOT fall back to whatever "java" is on PATH. That fallback was a
+// silent-wrong-version trap: a host with only Java 21 would hand it to a Minecraft that needs Java 25,
+// and the server would die on boot with an opaque UnsupportedClassVersionError instead of failing
+// here — at create time, with a message naming the package to install.
+func javaBinIn(root string, needed int) (string, error) {
+	entries, _ := os.ReadDir(root)
+	best, bestPath := -1, ""
+	for _, e := range entries {
+		m := javaDirRe.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		major, _ := strconv.Atoi(m[1])
+		if major < needed {
+			continue
+		}
+		bin := filepath.Join(root, e.Name(), "bin", "java")
+		if !executable(bin) {
+			continue
+		}
+		if best == -1 || major < best {
+			best, bestPath = major, bin
 		}
 	}
-	return "", fmt.Errorf("%w: java %d under %s", ErrNoJava, major, root)
+	if bestPath != "" {
+		return bestPath, nil
+	}
+	return "", fmt.Errorf("%w: Minecraft needs Java %d, but no Java %d or newer is installed here (install openjdk-%d-jre-headless)",
+		ErrNoJava, needed, needed, needed)
 }
 
 func executable(path string) bool {

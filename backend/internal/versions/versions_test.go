@@ -329,21 +329,27 @@ func TestJavaBinIn(t *testing.T) {
 		}
 		return p
 	}
-	amd64 := mkjava("java-21-openjdk-amd64", 0o755) // the exact Debian path
-	arm64 := mkjava("java-17-openjdk-arm64", 0o755) // only reachable by glob
-	mkjava("java-11-openjdk-amd64", 0o644)          // present but not executable
+	j21 := mkjava("java-21-openjdk-amd64", 0o755)
+	j17 := mkjava("java-17-openjdk-arm64", 0o755)
+	mkjava("java-11-openjdk-amd64", 0o644)     // present but NOT executable → never selected
+	mkjava("java-1.21.0-openjdk-amd64", 0o755) // dotted legacy alias → ignored (not a clean major)
 
-	if got, err := javaBinIn(root, 21); err != nil || got != amd64 {
-		t.Errorf("javaBinIn(21) = %q, %v; want the exact amd64 path %q", got, err, amd64)
+	// Exact match available → use it.
+	if got, err := javaBinIn(root, 21); err != nil || got != j21 {
+		t.Errorf("javaBinIn(21) = %q, %v; want %q", got, err, j21)
 	}
-	if got, err := javaBinIn(root, 17); err != nil || got != arm64 {
-		t.Errorf("javaBinIn(17) = %q, %v; want the globbed path %q", got, err, arm64)
+	// Needs 17, both 17 and 21 present → the CLOSEST that satisfies, i.e. 17.
+	if got, err := javaBinIn(root, 17); err != nil || got != j17 {
+		t.Errorf("javaBinIn(17) = %q, %v; want the closest satisfying JDK %q", got, err, j17)
 	}
-	if _, err := javaBinIn(root, 11); !errors.Is(err, ErrNoJava) {
-		t.Errorf("non-executable java must not be selected: err = %v", err)
+	// Needs 11: java-11 is non-executable and must be skipped, but java-17 satisfies >= 11 — a newer
+	// runtime is a valid answer, not an error.
+	if got, err := javaBinIn(root, 11); err != nil || got != j17 {
+		t.Errorf("javaBinIn(11) = %q, %v; want the next-newest executable JDK %q (non-exec java-11 skipped)", got, err, j17)
 	}
-	if _, err := javaBinIn(root, 8); !errors.Is(err, ErrNoJava) {
-		t.Errorf("missing java: err = %v, want ErrNoJava", err)
+	// Needs 25: nothing that new is installed → a clear error, NOT a silent fall-through to Java 21.
+	if _, err := javaBinIn(root, 25); !errors.Is(err, ErrNoJava) {
+		t.Errorf("javaBinIn(25) with no Java 25+ must be ErrNoJava, got %v", err)
 	}
 }
 

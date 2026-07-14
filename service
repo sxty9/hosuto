@@ -140,10 +140,12 @@ build_daemon() {
 
 # ── the game runtime ──────────────────────────────────────────────────────────────
 # Java is not on a stock Ubuntu. versions.JavaBin globs /usr/lib/jvm for the major a given Minecraft
-# version demands — 21 for 1.20.5+, 17 for 1.17–1.20.4 — so both JREs are installed and each server
-# gets the right one. Headless: the desktop JRE would drag X11 onto a server.
+# version demands — 25 for 1.21.6+/26.x, 21 for 1.20.5–1.21.5, 17 for 1.17–1.20.4 — so all three
+# JREs are installed and each server gets a runtime new enough for its version (hosuto picks the
+# smallest installed major that satisfies the version's requirement, so 25 also covers anything
+# needing 22–24). Headless: the desktop JRE would drag X11 onto a server.
 ensure_java() {
-  local pkgs=(openjdk-21-jre-headless openjdk-17-jre-headless) missing=() p
+  local pkgs=(openjdk-25-jre-headless openjdk-21-jre-headless openjdk-17-jre-headless) missing=() p
   for p in "${pkgs[@]}"; do
     dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q '^install ok installed$' || missing+=("$p")
   done
