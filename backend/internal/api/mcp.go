@@ -175,6 +175,52 @@ func (s *Server) mcp() *mcp.Registry {
 	reg.Register(s.lifecycleTool("restart", "Restart the Minecraft server. This disconnects players briefly — confirm with the user first. Owner, admin, or an op-level member.", "restarted"))
 
 	reg.Register(mcp.Tool{
+		Name: "server_command",
+		Description: "Run a Minecraft console command on a RUNNING server (via RCON) and return the console output. " +
+			"This is how you inspect or change live world state that the specific tools do not cover — e.g. " +
+			"\"time query daytime\", \"time set day\", \"weather clear\", \"gamerule keepInventory true\", " +
+			"\"difficulty peaceful\", \"give <player> minecraft:diamond 1\", \"tp <player> 0 100 0\", \"say hello\". " +
+			"One command per call; the leading slash is optional. The server must be up (start it first). " +
+			"To stop the server use server_stop, not this. Owner, admin, or an op-level member.",
+		InputSchema: schema(map[string]any{
+			"server":  serverProp,
+			"command": map[string]any{"type": "string", "description": `The console command, without the leading slash, e.g. "time query daytime".`},
+		}, "command"),
+		Handler: func(ctx context.Context, cAny any, args json.RawMessage) (any, error) {
+			var a struct{ Server, Command string }
+			decodeArgs(args, &a)
+			c := cAny.(*mcpCaller)
+			srv, err := s.mcpTarget(ctx, c, a.Server, accessControl)
+			if err != nil {
+				return nil, err
+			}
+			cmd := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(a.Command), "/"))
+			if cmd == "" {
+				return nil, errors.New(`which command? give a console command, e.g. "time query daytime"`)
+			}
+			if len(cmd) > 1200 {
+				return nil, errors.New("command too long for a single RCON frame")
+			}
+			// `stop` exits the JVM outside hosuto's managed lifecycle; the dedicated tool does it cleanly.
+			if strings.EqualFold(strings.Fields(cmd)[0], "stop") {
+				return nil, errors.New("use server_stop to stop the server")
+			}
+			replies, ok, err := s.rt.Command(ctx, srv, cmd)
+			if err != nil {
+				return nil, errors.New("the server rejected the command")
+			}
+			if !ok {
+				return nil, errors.New("the server is not running (or its console is not up yet) — start it first")
+			}
+			out := ""
+			if len(replies) > 0 {
+				out = replies[0]
+			}
+			return map[string]any{"command": cmd, "output": out}, nil
+		},
+	})
+
+	reg.Register(mcp.Tool{
 		Name:        "autostart_set",
 		Description: "Turn on or off whether the server comes up automatically with the operating system. This does NOT start or stop the server now. Owner only.",
 		InputSchema: schema(map[string]any{

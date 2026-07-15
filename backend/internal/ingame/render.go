@@ -93,7 +93,7 @@ func (e *Engine) replyHelp(ctx context.Context, srv store.Server, player string)
 // identical to typing it.
 func (e *Engine) replyList(ctx context.Context, srv store.Server, player string, list []chatstore.Summary, activeID string) {
 	cmds := make([]string, 0, len(list)+1)
-	if cmd, ok := tellrawCmd(player, "Chats (newest first) — click to resume:", colorInfo); ok {
+	if cmd, ok := tellrawCmd(player, "Chats (newest first) — click one, then press Enter to resume:", colorInfo); ok {
 		cmds = append(cmds, cmd)
 	}
 	for i, c := range list {
@@ -107,10 +107,14 @@ func (e *Engine) replyList(ctx context.Context, srv store.Server, player string,
 			label += " (current)"
 			color = colorActive
 		}
+		// suggest_command, not run_command: since the 1.19 chat-signing overhaul a client refuses to
+		// SEND a chat message from a run_command click (only real /commands run). Our log-tail design
+		// needs "!ai resume N" to land as a normal chat line, so we prefill the player's chat box and
+		// let them press Enter — the one interaction that reliably produces a signed chat message.
 		comp := textComponent{
 			Text:  label,
 			Color: color,
-			Click: &clickEvent{Action: "run_command", Value: e.trigger() + " resume " + fmt.Sprint(i+1)},
+			Click: &clickEvent{Action: "suggest_command", Value: e.trigger() + " resume " + fmt.Sprint(i+1)},
 		}
 		if b, err := json.Marshal(comp); err == nil {
 			cmd := "tellraw " + player + " " + string(b)
