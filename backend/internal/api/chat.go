@@ -94,7 +94,14 @@ func (s *Server) appendChat(w http.ResponseWriter, r *http.Request, u *auth.User
 	now := time.Now().UnixMilli()
 	var msgs []chatstore.Msg
 	if body.User != "" {
-		msgs = append(msgs, chatstore.Msg{Role: "user", Content: body.User, Author: u.Username, TS: now})
+		// Stamp the operator's in-game name so the shared log shows the Minecraft identity behind each
+		// request (the UI falls back to the username when there is no linked account). The face is
+		// rendered live from the avatar endpoint, so only the name is denormalised here.
+		name := ""
+		if acc, ok := s.st.Account(u.Username); ok {
+			name = acc.Name
+		}
+		msgs = append(msgs, chatstore.Msg{Role: "user", Content: body.User, Author: u.Username, Name: name, TS: now})
 	}
 	if body.Assistant != "" {
 		msgs = append(msgs, chatstore.Msg{Role: "assistant", Content: body.Assistant, Engine: body.Engine, Model: body.Model, TS: now})

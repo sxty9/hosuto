@@ -166,7 +166,8 @@ export type Tab = 'reach' | 'players' | 'modding' | 'files' | 'ai' | 'export';
 export interface ChatMsg {
   role: 'user' | 'assistant';
   content: string;
-  author?: string;
+  author?: string; // user turn: the operator's holistic (Linux) username
+  name?: string; // user turn: the operator's Minecraft name at post time (UI falls back to author)
   engine?: string; // assistant turn: which aigentic engine answered
   model?: string; // assistant turn: which concrete model answered
   ts: number;

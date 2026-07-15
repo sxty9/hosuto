@@ -8,6 +8,7 @@
 // turns land.
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import {
+  Avatar,
   Badge,
   Box,
   Button,
@@ -22,6 +23,7 @@ import {
   useT,
   type ServiceContextProps,
 } from '@holistic/ui';
+import { faceUrl } from './face';
 import type { ChatMsg, Conversation, ServerView } from './types';
 
 interface RunResponse {
@@ -131,10 +133,13 @@ export function AskAiThread({
             {history.map((m, i) =>
               m.role === 'user' ? (
                 <Stack key={i} gap={1} align="end">
-                  {m.author && m.author !== user.username && (
-                    <Text variant="caption" color="tertiary">
-                      {m.author}
-                    </Text>
+                  {m.author && (
+                    <Stack direction="row" align="center" gap={2}>
+                      <Text variant="caption" color="tertiary">
+                        {m.name || m.author}
+                      </Text>
+                      <Avatar name={m.name || m.author} src={faceUrl(api, m.author, 40)} size={20} />
+                    </Stack>
                   )}
                   <Box className="self-end max-w-[85%] rounded-md bg-accent/15 px-3 py-2">
                     <Text className="whitespace-pre-wrap leading-relaxed">{m.content}</Text>
@@ -155,9 +160,17 @@ export function AskAiThread({
               ),
             )}
             {pending && (
-              <Box className="self-end max-w-[85%] rounded-md bg-accent/15 px-3 py-2 opacity-70">
-                <Text className="whitespace-pre-wrap leading-relaxed">{pending}</Text>
-              </Box>
+              <Stack gap={1} align="end">
+                <Stack direction="row" align="center" gap={2}>
+                  <Text variant="caption" color="tertiary">
+                    {user.username}
+                  </Text>
+                  <Avatar name={user.username} src={faceUrl(api, user.username, 40)} size={20} />
+                </Stack>
+                <Box className="self-end max-w-[85%] rounded-md bg-accent/15 px-3 py-2 opacity-70">
+                  <Text className="whitespace-pre-wrap leading-relaxed">{pending}</Text>
+                </Box>
+              </Stack>
             )}
           </Stack>
         )}

@@ -46,7 +46,8 @@ var (
 type Msg struct {
 	Role    string `json:"role"`             // "user" | "assistant"
 	Content string `json:"content"`          // the text
-	Author  string `json:"author,omitempty"` // the operator who sent a user turn (empty for the assistant)
+	Author  string `json:"author,omitempty"` // the operator (Linux username) who sent a user turn
+	Name    string `json:"name,omitempty"`   // the operator's in-game name at post time (UI falls back to Author)
 	Engine  string `json:"engine,omitempty"` // assistant turn: the aigentic engine that answered
 	Model   string `json:"model,omitempty"`  // assistant turn: the concrete model that answered
 	TS      int64  `json:"ts"`               // epoch ms
