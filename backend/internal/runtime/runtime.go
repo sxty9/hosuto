@@ -476,6 +476,35 @@ func (m *Manager) Ping(ctx context.Context, srv store.Server) (time.Duration, bo
 	return time.Since(start), true
 }
 
+// OnlinePlayers returns the names currently connected, read authoritatively from the server console
+// (`list`) rather than the Server List Ping sample, which vanilla caps at 12 names and a server may
+// hide. ok is false when the server is not up or its console does not answer; an empty (non-nil) slice
+// with ok=true means the server is up with nobody on.
+func (m *Manager) OnlinePlayers(ctx context.Context, srv store.Server) ([]string, bool) {
+	replies, ok, err := m.Command(ctx, srv, "list")
+	if !ok || err != nil || len(replies) == 0 {
+		return nil, false
+	}
+	return parsePlayerList(replies[0]), true
+}
+
+// parsePlayerList pulls the names out of a `list` reply, e.g.
+// "There are 2 of a max of 20 players online: Alice, Bob". The names always follow the final colon;
+// a reply with nothing after it means nobody is online. Returns a non-nil empty slice in that case.
+func parsePlayerList(reply string) []string {
+	out := []string{}
+	i := strings.LastIndex(reply, ":")
+	if i < 0 {
+		return out
+	}
+	for _, p := range strings.Split(reply[i+1:], ",") {
+		if n := strings.TrimSpace(p); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // Say sends a chat line to a running server (used to tell players a change landed).
 func (m *Manager) Say(ctx context.Context, srv store.Server, msg string) {
 	if m.State(ctx, srv) != "active" {

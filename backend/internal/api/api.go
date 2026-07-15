@@ -114,6 +114,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+base+"servers/{id}/restart", s.guard(rights.GroupPlay, true, s.lifecycle("restart")))
 	mux.HandleFunc("GET "+base+"servers/{id}/status", s.guard(rights.GroupPlay, false, s.status))
 	mux.HandleFunc("GET "+base+"servers/{id}/diagnose", s.guard(rights.GroupPlay, false, s.diagnose))
+	mux.HandleFunc("GET "+base+"servers/{id}/players/online", s.guard(rights.GroupPlay, false, s.onlinePlayers))
 	mux.HandleFunc("PUT "+base+"servers/{id}/autostart", s.guard(rights.GroupHost, true, s.setAutostart))
 
 	// Spieledateien: the server's own on-disk tree, browsed through the holistic Files UI. Owner-only
@@ -556,6 +557,35 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, u *auth.User) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.rt.Status(r.Context(), srv))
+}
+
+// onlinePlayers reports who is currently connected, read from the server console (authoritative,
+// unlike the SLP sample). Each name is mapped back to its holistic user when it belongs to a linked
+// account, so the UI can render that member's face; an open server's guests appear by name alone.
+func (s *Server) onlinePlayers(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	srv, ok := s.visible(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	names, ok := s.rt.OnlinePlayers(r.Context(), srv)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"reachable": false, "online": []any{}})
+		return
+	}
+	type onlinePlayer struct {
+		Name string `json:"name"`
+		User string `json:"user,omitempty"`
+	}
+	out := make([]onlinePlayer, 0, len(names))
+	for _, n := range names {
+		e := onlinePlayer{Name: n}
+		if user, ok := s.acc.UserByName(n); ok {
+			e.User = user
+		}
+		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"reachable": true, "online": out})
 }
 
 // diagnose answers "the start failed and I don't know why": it returns the tail of the server's

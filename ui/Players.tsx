@@ -12,6 +12,7 @@ import { useCallback, useRef, useState } from 'react';
 import {
   Avatar,
   Badge,
+  Box,
   Button,
   ContactPicker,
   EmptyState,
@@ -32,7 +33,7 @@ import {
   type SegmentedOption,
   type ServiceContextProps,
 } from '@holistic/ui';
-import type { Grant, JoinPolicy, Level, MembersResp, PolicyResp, ServerView } from './types';
+import type { Grant, JoinPolicy, Level, MembersResp, OnlineResp, PolicyResp, ServerView } from './types';
 import { faceUrl } from './face';
 
 interface PickedGroup {
@@ -49,12 +50,17 @@ export function Players({
 }: Pick<ServiceContextProps, 'api' | 'apiFor' | 'ui'> & { srv: ServerView }) {
   const t = useT();
   const q = useLiveQuery<MembersResp>(() => api.get<MembersResp>(`servers/${srv.id}/members`), 15000, [srv.id]);
+  // Who is actually connected right now, read live from the server console (every 8s).
+  const onlineQ = useLiveQuery<OnlineResp>(() => api.get<OnlineResp>(`servers/${srv.id}/players/online`), 8000, [srv.id]);
   const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const policy: JoinPolicy = q.data?.policy ?? srv.joinPolicy;
   const grants = q.data?.grants ?? [];
   const players = q.data?.players ?? [];
+  const online = onlineQ.data?.online ?? [];
+  // Members currently online, keyed by their holistic username, so a member row can show a live dot.
+  const onlineUsers = new Set(online.map((o) => o.user).filter(Boolean));
 
   const policyOptions: SegmentedOption<JoinPolicy>[] = [
     { value: 'whitelist', label: t('hosuto.policyWhitelist') },
@@ -104,6 +110,24 @@ export function Players({
           <SegmentedControl value={policy} onChange={(v) => void setPolicy(v)} options={policyOptions} />
           {busy && <Spinner className="ml-2 h-4 w-4" />}
         </Stack>
+      </Panel>
+
+      <Panel title={online.length ? `${t('hosuto.onlineNow')} (${online.length})` : t('hosuto.onlineNow')} className="p-4">
+        {!onlineQ.data && onlineQ.loading ? (
+          <Spinner className="h-4 w-4" />
+        ) : online.length === 0 ? (
+          <Text color="secondary">{t('hosuto.nobodyOnline')}</Text>
+        ) : (
+          <Stack gap={2}>
+            {online.map((o) => (
+              <Stack key={o.name} direction="row" align="center" gap={2}>
+                <Box className="h-2 w-2 shrink-0 rounded-full bg-success" />
+                <Avatar name={o.name} src={o.user ? faceUrl(api, o.user, 56) : undefined} size={28} />
+                <Text>{o.name}</Text>
+              </Stack>
+            ))}
+          </Stack>
+        )}
       </Panel>
 
       <Panel
@@ -159,7 +183,17 @@ export function Players({
                     )}
                   </Stack>
                 </Stack>
-                <Badge variant={p.level === 'op' ? 'accent' : 'neutral'}>{t(`hosuto.level.${p.level}`)}</Badge>
+                <Stack direction="row" align="center" gap={2}>
+                  {onlineUsers.has(p.user) && (
+                    <Stack direction="row" align="center" gap={1}>
+                      <Box className="h-2 w-2 shrink-0 rounded-full bg-success" />
+                      <Text variant="caption" color="secondary">
+                        {t('hosuto.online')}
+                      </Text>
+                    </Stack>
+                  )}
+                  <Badge variant={p.level === 'op' ? 'accent' : 'neutral'}>{t(`hosuto.level.${p.level}`)}</Badge>
+                </Stack>
               </Stack>
             ))}
           </Stack>

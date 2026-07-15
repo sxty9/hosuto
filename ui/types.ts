@@ -129,6 +129,17 @@ export interface MembersResp {
   players: Player[];
 }
 
+// One currently-connected player, read from the server console. user is the holistic username when the
+// name belongs to a linked account (so the UI can render that member's face); a guest has name only.
+export interface OnlinePlayer {
+  name: string;
+  user?: string;
+}
+export interface OnlineResp {
+  reachable: boolean;
+  online: OnlinePlayer[];
+}
+
 export interface PolicyResp {
   joinPolicy: JoinPolicy;
   restartRequired: boolean;
