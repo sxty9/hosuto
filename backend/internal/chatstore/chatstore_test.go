@@ -1,79 +1,108 @@
 package chatstore
 
 import (
-	"path/filepath"
+	"errors"
 	"testing"
 )
 
-func TestSharedThread(t *testing.T) {
+func TestConversations(t *testing.T) {
 	dir := t.TempDir()
 	s := New(dir)
-	const id = "srv-abc12345"
+	const srv = "srv-abc12345"
 
-	// An unseen server has an empty thread, not an error.
-	if msgs, err := s.Load(id); err != nil || len(msgs) != 0 {
-		t.Fatalf("empty load: %v %v", msgs, err)
+	// A fresh server has no conversations.
+	if list, err := s.List(srv); err != nil || len(list) != 0 {
+		t.Fatalf("empty list: %v %v", list, err)
 	}
 
-	// Two operators append to the SAME thread; both turns are there, attributed.
-	if _, err := s.Append(id, Msg{Role: "user", Content: "start it", Author: "alice", TS: 1}, Msg{Role: "assistant", Content: "done", TS: 2}); err != nil {
-		t.Fatal(err)
-	}
-	full, err := s.Append(id, Msg{Role: "user", Content: "who's on?", Author: "bob", TS: 3})
+	// Create two conversations.
+	a, err := s.Create(srv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(full) != 3 || full[0].Author != "alice" || full[2].Author != "bob" {
-		t.Fatalf("shared thread wrong: %+v", full)
+	b, err := s.Create(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.ID == b.ID {
+		t.Fatal("ids collide")
 	}
 
-	// It persists: a fresh store over the same dir sees the same thread.
-	if got, _ := New(dir).Load(id); len(got) != 3 {
-		t.Fatalf("not persisted: %+v", got)
+	// Two operators append to the SAME conversation; both turns land, attributed, and the title comes
+	// from the first user turn.
+	if _, err := s.Append(srv, a.ID, Msg{Role: "user", Content: "start the server please", Author: "alice", TS: 1}, Msg{Role: "assistant", Content: "done", Engine: "claude-cli", Model: "claude-opus-4-8", TS: 2}); err != nil {
+		t.Fatal(err)
+	}
+	conv, err := s.Append(srv, a.ID, Msg{Role: "user", Content: "who's on?", Author: "bob", TS: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conv.Messages) != 3 || conv.Title != "start the server please" || conv.Messages[1].Model != "claude-opus-4-8" {
+		t.Fatalf("conversation wrong: %+v", conv)
 	}
 
-	// A different server has its own thread.
-	if got, _ := s.Load("srv-99999999"); len(got) != 0 {
-		t.Fatalf("threads not isolated per server: %+v", got)
+	// The list shows both, newest first (a was just appended, so it sorts above the untouched b).
+	list, err := s.List(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 || list[0].ID != a.ID || list[0].Count != 3 || list[0].Title != "start the server please" {
+		t.Fatalf("list wrong: %+v", list)
 	}
 
-	// The thread is capped: the tail survives, the head is dropped.
-	big := make([]Msg, maxMessages+50)
+	// Persistence: a fresh store over the same dir sees the same conversation.
+	if got, err := New(dir).Get(srv, a.ID); err != nil || len(got.Messages) != 3 {
+		t.Fatalf("not persisted: %+v %v", got, err)
+	}
+
+	// Delete one conversation; the other survives.
+	if err := s.Delete(srv, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get(srv, a.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted conv still present: %v", err)
+	}
+	if _, err := s.Get(srv, b.ID); err != nil {
+		t.Fatalf("wrong conv deleted: %v", err)
+	}
+
+	// Appending to a missing conversation is ErrNotFound, not a silent create.
+	if _, err := s.Append(srv, "c00000000000", Msg{Role: "user", Content: "x"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("append to missing: %v", err)
+	}
+
+	// Cap: the tail survives.
+	big := make([]Msg, maxMessages+30)
 	for i := range big {
 		big[i] = Msg{Role: "user", Content: "x", TS: int64(i)}
 	}
-	capped, err := s.Append("srv-cccccccc", big...)
+	capped, err := s.Append(srv, b.ID, big...)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(capped) != maxMessages || capped[len(capped)-1].TS != int64(len(big)-1) {
-		t.Fatalf("cap wrong: len=%d lastTS=%d", len(capped), capped[len(capped)-1].TS)
+	if len(capped.Messages) != maxMessages || capped.Messages[len(capped.Messages)-1].TS != int64(len(big)-1) {
+		t.Fatalf("cap wrong: %d", len(capped.Messages))
 	}
 
-	// Delete drops exactly that server's file.
-	if err := s.Delete(id); err != nil {
+	// DeleteAll drops the server's whole chat dir.
+	if err := s.DeleteAll(srv); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := s.Load(id); len(got) != 0 {
-		t.Fatalf("not deleted: %+v", got)
-	}
-	if _, err := New(dir).Load("srv-cccccccc"); err != nil {
-		t.Fatalf("delete touched another thread: %v", err)
+	if list, _ := s.List(srv); len(list) != 0 {
+		t.Fatalf("DeleteAll left chats: %+v", list)
 	}
 }
 
-func TestRejectsBadID(t *testing.T) {
+func TestRejectsBadIDs(t *testing.T) {
 	s := New(t.TempDir())
-	for _, bad := range []string{"../etc/passwd", "srv-../x", "nope", "srv-xyz/../y", ""} {
-		if _, err := s.Load(bad); err == nil {
-			t.Fatalf("bad id %q was accepted", bad)
-		}
-		if _, err := s.Append(bad, Msg{Role: "user", Content: "x"}); err == nil {
-			t.Fatalf("bad id %q accepted on append", bad)
+	for _, bad := range []string{"../etc", "nope", "srv-x/y", ""} {
+		if _, err := s.List(bad); !errors.Is(err, ErrBadID) {
+			t.Fatalf("bad server id %q accepted: %v", bad, err)
 		}
 	}
-	// A file must never appear outside the store dir.
-	if _, err := filepath.Glob(filepath.Join(t.TempDir(), "*")); err != nil {
-		t.Fatal(err)
+	for _, bad := range []string{"../x", "c/y", "nope", "x.json", ""} {
+		if _, err := s.Get("srv-abc12345", bad); !errors.Is(err, ErrBadID) {
+			t.Fatalf("bad conv id %q accepted: %v", bad, err)
+		}
 	}
 }

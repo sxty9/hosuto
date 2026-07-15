@@ -1,12 +1,13 @@
-// This file serves the shared "Ask AI" thread. The chat is per-SERVER and shared across the server's
-// operators (owner, admin, op-level members) — the same people who may start and stop it — so it is
-// gated by controlled(), the operator check, not by mere visibility. The model call happens in the
-// browser (billed to each operator's own AI account); hosuto only persists the result, so the thread
-// survives reloads and every operator sees the same history, attributed to whoever asked.
+// This file serves the shared "Ask AI" conversations. Chats are per-SERVER and shared across the
+// server's operators (owner, admin, op-level members) — the same people who may start and stop it —
+// so every handler is gated by controlled(), the operator check. The model call happens in the
+// browser (billed to each operator's own AI account); hosuto persists the result, so conversations
+// survive reloads, every operator sees the same list, and each turn is attributed to whoever asked.
 package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -25,24 +26,56 @@ func (s *Server) controlled(r *http.Request, u *auth.User) (store.Server, bool) 
 	return srv, s.hasAccess(r.Context(), srv, u, accessControl)
 }
 
+func (s *Server) listChats(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	srv, ok := s.controlled(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	list, err := s.chats.List(srv.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not load the chats")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"conversations": list})
+}
+
+func (s *Server) createChat(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	srv, ok := s.controlled(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	c, err := s.chats.Create(srv.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not create the chat")
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
 func (s *Server) getChat(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	srv, ok := s.controlled(r, u)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "No such server")
 		return
 	}
-	msgs, err := s.chats.Load(srv.ID)
+	c, err := s.chats.Get(srv.ID, r.PathValue("cid"))
+	if errors.Is(err, chatstore.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "No such chat")
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not load the chat")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"messages": msgs})
+	writeJSON(w, http.StatusOK, c)
 }
 
-// postChat appends one exchange (the operator's message and the AI's answer) to the shared thread,
-// stamping the user turn with WHO sent it, and returns the full thread so the caller renders the
-// authoritative state (which may also carry another operator's turns that landed meanwhile).
-func (s *Server) postChat(w http.ResponseWriter, r *http.Request, u *auth.User) {
+// appendChat records one exchange (the operator's message and the AI's answer, plus which engine and
+// model produced it) into a conversation, stamping the user turn with WHO sent it, and returns the
+// updated conversation.
+func (s *Server) appendChat(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	srv, ok := s.controlled(r, u)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "No such server")
@@ -70,23 +103,27 @@ func (s *Server) postChat(w http.ResponseWriter, r *http.Request, u *auth.User) 
 		writeErr(w, http.StatusBadRequest, "Nothing to add")
 		return
 	}
-	full, err := s.chats.Append(srv.ID, msgs...)
+	c, err := s.chats.Append(srv.ID, r.PathValue("cid"), msgs...)
+	if errors.Is(err, chatstore.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "No such chat")
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the chat")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"messages": full})
+	writeJSON(w, http.StatusOK, c)
 }
 
-// clearChat wipes the shared thread. Any operator may clear it — it is their shared surface.
-func (s *Server) clearChat(w http.ResponseWriter, r *http.Request, u *auth.User) {
+// deleteChat removes one conversation. Any operator may delete one — it is their shared surface.
+func (s *Server) deleteChat(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	srv, ok := s.controlled(r, u)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "No such server")
 		return
 	}
-	if err := s.chats.Delete(srv.ID); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not clear the chat")
+	if err := s.chats.Delete(srv.ID, r.PathValue("cid")); err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not delete the chat")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

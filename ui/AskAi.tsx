@@ -1,202 +1,134 @@
-// AskAi is hosuto's "Ask AI" tab: aigentic's chat, bound to ONE server and wired to hosuto's tools.
+// AskAi is hosuto's "Ask AI" tab: aigentic's chat, bound to a server and wired to hosuto's tools.
 //
-// Two things make it more than a private chat:
-//   1. The thread is SHARED and PERSISTENT. It lives in hosuto (GET/POST servers/<id>/chat), so it
-//      survives reloads and every operator of the server sees the same history — polled live, and
-//      each user turn labelled with who asked. Operators = owner, admin, op-level members; the tab
-//      is gated on exactly that (canControl), the same people who may start and stop the server.
-//   2. It is agentic. On send it mints a short-lived, server-scoped MCP token and hands it to
-//      aigentic's claude-cli engine, so the model can actually operate the server (status, start/
-//      stop, whitelist, mods, files, logs) through hosuto's MCP tools.
-//
-// The model call itself runs in the browser, billed to the sending operator's own aigentic account
-// (subscription or API key). hosuto only records the exchange in the shared thread — the split that
-// keeps the LLM in aigentic and the server chat in hosuto.
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+// Like aigentic's chat it manages MANY conversations — a sidebar to create, pick, search and delete
+// them — but the conversations are SHARED and PERSISTENT: they live in hosuto (per server), so every
+// operator of the server (owner, admin, op-level members) sees the same list and threads, and they
+// survive reloads. The tab is gated on exactly those operators (canControl in Dashboard), the same
+// people who may start and stop the server. The MCP token minted for the agentic runs is shared
+// across a session's conversations (one per operator, scoped to this server).
+import { useEffect, useRef, useState } from 'react';
 import {
-  Badge,
-  Box,
   Button,
   EmptyState,
-  Markdown,
+  IconButton,
+  PlusIcon,
   ScrollArea,
+  SearchField,
+  ServerIcon,
   Spinner,
   Stack,
   Text,
-  Textarea,
+  TrashIcon,
   useLiveQuery,
   useT,
   type ServiceContextProps,
 } from '@holistic/ui';
-import type { ChatMsg, ChatResp, ServerView } from './types';
+import { AskAiThread } from './AskAiThread';
+import type { ChatsResp, ConvSummary, ServerView } from './types';
 
-// The aigentic result envelope (a prizm Response whose Data is the aigentic Result).
-interface RunResponse {
-  data: { output: string; engine?: string; model?: string };
-}
-
-const SCROLL_ID = 'hosuto-ai-scroll';
-const scrollEl = () => document.getElementById(SCROLL_ID);
-
-// Friendly labels for aigentic's engine ids (matching aigentic's own picker), so an operator sees
-// which AI answered rather than an internal id. The tab always drives claude-cli — the only engine
-// that can call the server tools — so answers show "Claude CLI" plus the concrete model.
-const ENGINE_LABEL: Record<string, string> = {
-  'claude-cli': 'Claude CLI',
-  'claude-api': 'Claude API',
-  ollama: 'Local',
-  choose: 'Auto',
-};
-const engineLabel = (e?: string) => (e ? (ENGINE_LABEL[e] ?? e) : 'AI');
-
-// clean strips the trailing "Assistant:" the model may echo back from the transcript.
-function clean(s: string): string {
-  return s.replace(/^\s*Assistant:\s*/i, '').trim();
-}
-
-function systemPrompt(srv: ServerView): string {
-  return [
-    `You are the assistant for the Minecraft server "${srv.name}" (address ${srv.host}, Minecraft ${srv.mcVersion}, loader ${srv.loader}).`,
-    `You can inspect and operate THIS server through the hosuto tools: status, players, logs, start/stop/restart, autostart, whitelist, join policy, mods and files.`,
-    `This connection is already bound to this server, so you may omit the "server" argument on every tool.`,
-    `This is a shared operator chat — more than one person may be talking to you. Prefer calling a tool over guessing. Before anything disruptive — stopping or restarting the server, removing a mod, or removing a member — confirm with the user first.`,
-    `Answer concisely, in the user's language.`,
-  ].join(' ');
-}
-
-export function AskAi({ api, apiFor, ui, user, srv }: Pick<ServiceContextProps, 'api' | 'apiFor' | 'ui' | 'user'> & { srv: ServerView }) {
+export function AskAi(props: Pick<ServiceContextProps, 'api' | 'apiFor' | 'ui' | 'user'> & { srv: ServerView }) {
+  const { api, ui, srv } = props;
   const t = useT();
-  // The shared thread, polled so operators see each other's turns land.
-  const q = useLiveQuery<ChatResp>(() => api.get<ChatResp>(`servers/${srv.id}/chat`), 5000, [srv.id]);
-  const history: ChatMsg[] = q.data?.messages ?? [];
+  const q = useLiveQuery<ChatsResp>(() => api.get<ChatsResp>(`servers/${srv.id}/chats`), 5000, [srv.id]);
+  const conversations: ConvSummary[] = q.data?.conversations ?? [];
 
-  const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
-  // The operator's own turn, shown optimistically until the shared thread reflects it.
-  const [pending, setPending] = useState<string | null>(null);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
+  // One MCP token per operator per session, scoped to this server, reused across conversations.
   const tokenRef = useRef<string | null>(null);
-  const prevLen = useRef(0);
 
-  // A new message (loaded, sent, or received) jumps to the bottom; the "Working…" row stays in view.
+  // Default the selection to the newest conversation, and heal it if the active one is deleted.
   useEffect(() => {
-    const el = scrollEl();
-    const total = history.length + (pending ? 1 : 0);
-    if (el && (total > prevLen.current || busy)) el.scrollTop = el.scrollHeight;
-    prevLen.current = total;
-  }, [history.length, pending, busy]);
+    if (conversations.length === 0) {
+      if (activeId !== null) setActiveId(null);
+      return;
+    }
+    if (!activeId || !conversations.some((c) => c.id === activeId)) {
+      setActiveId(conversations[0].id);
+    }
+  }, [conversations, activeId]);
 
-  async function mcpToken(): Promise<string> {
+  async function getToken(): Promise<string> {
     if (tokenRef.current) return tokenRef.current;
     const res = await api.post<{ token: string }>('mcp/token', { serverId: srv.id });
     tokenRef.current = res.token;
     return res.token;
   }
 
-  async function send() {
-    const text = input.trim();
-    if (!text || busy) return;
-    setPending(text);
-    setInput('');
-    setBusy(true);
+  async function newChat() {
     try {
-      const token = await mcpToken();
-      // The whole shared thread plus this turn is sent as one transcript; the model continues after
-      // "Assistant:". It sees every operator's turns, which is the point of a shared chat.
-      const transcript =
-        [...history, { role: 'user', content: text }].map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n') + '\n\nAssistant:';
-      const res = await apiFor('aigentic').post<RunResponse>('run', {
-        header: { kind: 'claude-cli' },
-        data: { prompt: transcript, system: systemPrompt(srv), mcp: [{ name: 'hosuto', token }] },
-      });
-      const answer = clean(res.data.output);
-      // Persist the exchange to the shared thread — including which engine/model answered, so the
-      // shared log is transparent about the AI used — then refresh so it (and anyone else's turns) show.
-      await api.post(`servers/${srv.id}/chat`, { user: text, assistant: answer, engine: res.data.engine, model: res.data.model });
-      setPending(null);
+      const c = await api.post<{ id: string }>(`servers/${srv.id}/chats`, {});
+      setActiveId(c.id);
       q.refresh();
     } catch (e) {
-      setPending(null);
-      const msg = (e as Error).message || '';
-      const description = /unavailable|credential|subscription|no Claude/i.test(msg) ? t('hosuto.ai.noEngine') : msg;
-      ui.toast({ title: t('hosuto.ai.failed'), description, variant: 'error' });
-    } finally {
-      setBusy(false);
+      ui.toast({ title: t('hosuto.ai.failed'), description: (e as Error).message, variant: 'error' });
     }
   }
 
-  function onKey(e: KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      void send();
+  async function deleteChat(id: string) {
+    const ok = await ui.confirm({ title: t('hosuto.ai.deleteChatTitle'), danger: true, confirmLabel: t('hosuto.remove') });
+    if (!ok) return;
+    try {
+      await api.del(`servers/${srv.id}/chats/${id}`);
+      if (id === activeId) setActiveId(null);
+      q.refresh();
+    } catch (e) {
+      ui.toast({ title: t('hosuto.ai.failed'), description: (e as Error).message, variant: 'error' });
     }
   }
 
-  const empty = history.length === 0 && !pending;
+  const filtered = search ? conversations.filter((c) => (c.title || '').toLowerCase().includes(search.toLowerCase())) : conversations;
+
+  if (q.loading && !q.data) {
+    return (
+      <Stack align="center" justify="center" className="min-h-[40vh]">
+        <Spinner className="h-6 w-6" />
+      </Stack>
+    );
+  }
 
   return (
-    <Stack gap={3} className="h-full">
-      <ScrollArea id={SCROLL_ID} className="grow max-h-[58vh] min-h-[30vh] pr-1">
-        {empty ? (
-          <EmptyState title={srv.name} description={t('hosuto.ai.empty')} />
-        ) : (
-          <Stack gap={4}>
-            {history.map((m, i) =>
-              m.role === 'user' ? (
-                <Stack key={i} gap={1} align="end">
-                  {m.author && m.author !== user.username && (
-                    <Text variant="caption" color="tertiary">
-                      {m.author}
-                    </Text>
-                  )}
-                  <Box className="self-end max-w-[85%] rounded-md bg-accent/15 px-3 py-2">
-                    <Text className="whitespace-pre-wrap leading-relaxed">{m.content}</Text>
-                  </Box>
-                </Stack>
-              ) : (
-                <Stack key={i} gap={1} className="max-w-full">
-                  <Stack direction="row" align="center" gap={2}>
-                    <Badge variant="accent">{engineLabel(m.engine)}</Badge>
-                    {m.model && (
-                      <Text variant="caption" color="tertiary">
-                        {m.model}
-                      </Text>
-                    )}
-                  </Stack>
-                  {m.content ? <Markdown text={m.content} /> : <Text color="secondary">{t('hosuto.ai.emptyReply')}</Text>}
-                </Stack>
-              ),
-            )}
-            {pending && (
-              <Box className="self-end max-w-[85%] rounded-md bg-accent/15 px-3 py-2 opacity-70">
-                <Text className="whitespace-pre-wrap leading-relaxed">{pending}</Text>
-              </Box>
-            )}
-          </Stack>
-        )}
-        {busy && (
-          <Stack direction="row" align="center" gap={2} className="mt-3">
-            <Spinner className="h-4 w-4" />
-            <Text variant="footnote" color="secondary">
-              {t('hosuto.ai.thinking')}
-            </Text>
-          </Stack>
-        )}
-      </ScrollArea>
-
-      <Stack direction="row" gap={2} align="end">
-        <Stack grow>
-          <Textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={onKey}
-            rows={2}
-            className="w-full"
-            placeholder={t('hosuto.ai.placeholder')}
-          />
-        </Stack>
-        <Button variant="primary" loading={busy} disabled={!input.trim()} onClick={send}>
-          Send
+    <Stack direction="row" gap={4} align="stretch" className="min-h-[60vh]">
+      <Stack gap={2} className="w-60 shrink-0">
+        <Button variant="primary" size="sm" iconLeft={<PlusIcon className="h-4 w-4" />} onClick={newChat}>
+          {t('hosuto.ai.newChat')}
         </Button>
+        <SearchField value={search} onChange={setSearch} placeholder={t('hosuto.ai.searchChats')} />
+        <ScrollArea className="grow max-h-[52vh] -mr-1 pr-1">
+          {filtered.length === 0 ? (
+            <Text variant="caption" color="tertiary">
+              {search ? t('hosuto.ai.noMatch') : t('hosuto.ai.noChats')}
+            </Text>
+          ) : (
+            <Stack gap={1}>
+              {filtered.map((c) => (
+                <Stack key={c.id} direction="row" align="center" gap={1}>
+                  <Button
+                    variant={c.id === activeId ? 'secondary' : 'ghost'}
+                    size="sm"
+                    className="grow min-w-0 justify-start"
+                    onClick={() => setActiveId(c.id)}
+                  >
+                    <Text truncate className="w-full text-left">
+                      {c.title || t('hosuto.ai.newChat')}
+                    </Text>
+                  </Button>
+                  <IconButton label={t('hosuto.ai.deleteChat')} size="sm" variant="ghost" onClick={() => void deleteChat(c.id)}>
+                    <TrashIcon className="h-4 w-4" />
+                  </IconButton>
+                </Stack>
+              ))}
+            </Stack>
+          )}
+        </ScrollArea>
+      </Stack>
+
+      <Stack grow className="min-w-0">
+        {activeId ? (
+          <AskAiThread key={activeId} {...props} convId={activeId} getToken={getToken} onPosted={q.refresh} />
+        ) : (
+          <EmptyState icon={<ServerIcon />} title={srv.name} description={t('hosuto.ai.pickOrNew')} action={<Button variant="primary" iconLeft={<PlusIcon className="h-4 w-4" />} onClick={newChat}>{t('hosuto.ai.newChat')}</Button>} />
+        )}
       </Stack>
     </Stack>
   );

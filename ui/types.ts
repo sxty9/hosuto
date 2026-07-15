@@ -171,6 +171,20 @@ export interface ChatMsg {
   model?: string; // assistant turn: which concrete model answered
   ts: number;
 }
-export interface ChatResp {
+// One shared conversation for a server, with its full message list.
+export interface Conversation {
+  id: string;
+  title: string;
+  updated: number;
   messages: ChatMsg[];
+}
+// The lightweight sidebar view of a conversation (no message bodies).
+export interface ConvSummary {
+  id: string;
+  title: string;
+  updated: number;
+  count: number;
+}
+export interface ChatsResp {
+  conversations: ConvSummary[];
 }

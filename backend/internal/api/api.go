@@ -150,12 +150,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"mcp/token", s.guard(rights.GroupPlay, false, s.mcpTokenStatus))
 	mux.HandleFunc("DELETE "+base+"mcp/token", s.guard(rights.GroupPlay, true, s.revokeMCPToken))
 
-	// The "Ask AI" chat is a SHARED thread per server, persisted here and visible to every operator
-	// of the server. The coarse right gates the route; controlled() enforces operator access (owner,
-	// admin, or an op-level member) inside every handler — the same rule that gates start/stop.
-	mux.HandleFunc("GET "+base+"servers/{id}/chat", s.guard(rights.GroupPlay, false, s.getChat))
-	mux.HandleFunc("POST "+base+"servers/{id}/chat", s.guard(rights.GroupPlay, true, s.postChat))
-	mux.HandleFunc("DELETE "+base+"servers/{id}/chat", s.guard(rights.GroupPlay, true, s.clearChat))
+	// The "Ask AI" chats are SHARED per server, persisted here and visible to every operator of the
+	// server — many conversations, managed like aigentic's own chat. The coarse right gates the route;
+	// controlled() enforces operator access (owner, admin, or an op-level member) inside every handler.
+	mux.HandleFunc("GET "+base+"servers/{id}/chats", s.guard(rights.GroupPlay, false, s.listChats))
+	mux.HandleFunc("POST "+base+"servers/{id}/chats", s.guard(rights.GroupPlay, true, s.createChat))
+	mux.HandleFunc("GET "+base+"servers/{id}/chats/{cid}", s.guard(rights.GroupPlay, false, s.getChat))
+	mux.HandleFunc("POST "+base+"servers/{id}/chats/{cid}", s.guard(rights.GroupPlay, true, s.appendChat))
+	mux.HandleFunc("DELETE "+base+"servers/{id}/chats/{cid}", s.guard(rights.GroupPlay, true, s.deleteChat))
 
 	return mux
 }
@@ -500,7 +502,7 @@ func (s *Server) deleteServer(w http.ResponseWriter, r *http.Request, u *auth.Us
 		writeErr(w, http.StatusInternalServerError, "Could not remove the server")
 		return
 	}
-	_ = s.chats.Delete(srv.ID) // the shared thread goes with the server it belonged to
+	_ = s.chats.DeleteAll(srv.ID) // the shared chats go with the server they belonged to
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
