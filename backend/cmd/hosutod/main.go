@@ -20,6 +20,7 @@ import (
 
 	"hosuto/internal/api"
 	"hosuto/internal/auth"
+	"hosuto/internal/chathub"
 	"hosuto/internal/chatstore"
 	"hosuto/internal/contax"
 	"hosuto/internal/directory"
@@ -80,8 +81,11 @@ func main() {
 		log.Fatalf("hosutod: mcp tokens: %v", err)
 	}
 
-	// The shared per-server "Ask AI" threads live beside the state file, one JSON file per server.
+	// The shared per-server "Ask AI" conversations live beside the state file, one JSON file each.
 	chats := chatstore.New(filepath.Join(filepath.Dir(*statePath), "chats"))
+	// The real-time layer: pushes new turns and presence ("typing / asking the AI") to operators
+	// watching a conversation over SSE. In-memory; the persisted conversations remain the truth.
+	hub := chathub.New()
 
 	// Admin configuration comes from the central Configuration tab, not from hosuto's own UI: the
 	// manifest in /etc/holistic/config.d declares the knobs, the dashboard writes the values, and this
@@ -130,7 +134,7 @@ func main() {
 	}()
 
 	srv := &http.Server{
-		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk, tok, chats).Handler(),
+		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk, tok, chats, hub).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	// Bind synchronously so "address already in use" surfaces here, not inside a goroutine.

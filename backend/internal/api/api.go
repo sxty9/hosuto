@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"hosuto/internal/auth"
+	"hosuto/internal/chathub"
 	"hosuto/internal/chatstore"
 	"hosuto/internal/contax"
 	"hosuto/internal/directory"
@@ -65,6 +66,7 @@ type Server struct {
 	skin  *skin.Renderer
 	tok   *mcp.TokenStore
 	chats *chatstore.Store
+	hub   *chathub.Hub
 	http  *http.Client
 }
 
@@ -72,9 +74,9 @@ type Server struct {
 func New(v *auth.Verifier, st *store.Store, cfg *hconfig.Config, rt *runtime.Manager,
 	dir *directory.Directory, cx *contax.Client, nt *notify.Client, mc *mcapi.Client,
 	mr *modrinth.Client, vc *versions.Client, sk *skin.Renderer, tok *mcp.TokenStore,
-	chats *chatstore.Store) *Server {
+	chats *chatstore.Store, hub *chathub.Hub) *Server {
 	return &Server{v: v, st: st, cfg: cfg, rt: rt, dir: dir, cx: cx, nt: nt, mc: mc, mr: mr, vc: vc,
-		skin: sk, tok: tok, chats: chats, http: &http.Client{Timeout: 60 * time.Second}}
+		skin: sk, tok: tok, chats: chats, hub: hub, http: &http.Client{Timeout: 60 * time.Second}}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -158,6 +160,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"servers/{id}/chats/{cid}", s.guard(rights.GroupPlay, false, s.getChat))
 	mux.HandleFunc("POST "+base+"servers/{id}/chats/{cid}", s.guard(rights.GroupPlay, true, s.appendChat))
 	mux.HandleFunc("DELETE "+base+"servers/{id}/chats/{cid}", s.guard(rights.GroupPlay, true, s.deleteChat))
+	// Real-time: a live event stream per conversation (new turns + who is typing/asking) and the
+	// presence heartbeat operators post while they type or wait for the AI.
+	mux.HandleFunc("GET "+base+"servers/{id}/chats/{cid}/events", s.guard(rights.GroupPlay, false, s.chatEvents))
+	mux.HandleFunc("POST "+base+"servers/{id}/chats/{cid}/presence", s.guard(rights.GroupPlay, true, s.chatPresence))
 
 	return mux
 }

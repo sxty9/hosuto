@@ -189,3 +189,9 @@ export interface ConvSummary {
 export interface ChatsResp {
   conversations: ConvSummary[];
 }
+// Live presence of an operator in a conversation (from the SSE stream).
+export interface PresenceEntry {
+  author: string;
+  name?: string;
+  state: 'typing' | 'working';
+}

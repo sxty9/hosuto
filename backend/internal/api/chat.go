@@ -8,10 +8,12 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
 	"hosuto/internal/auth"
+	"hosuto/internal/chathub"
 	"hosuto/internal/chatstore"
 	"hosuto/internal/store"
 )
@@ -110,7 +112,8 @@ func (s *Server) appendChat(w http.ResponseWriter, r *http.Request, u *auth.User
 		writeErr(w, http.StatusBadRequest, "Nothing to add")
 		return
 	}
-	c, err := s.chats.Append(srv.ID, r.PathValue("cid"), msgs...)
+	cid := r.PathValue("cid")
+	c, err := s.chats.Append(srv.ID, cid, msgs...)
 	if errors.Is(err, chatstore.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "No such chat")
 		return
@@ -119,7 +122,93 @@ func (s *Server) appendChat(w http.ResponseWriter, r *http.Request, u *auth.User
 		writeErr(w, http.StatusInternalServerError, "Could not save the chat")
 		return
 	}
+	// Push the updated conversation to everyone watching it live, and clear the sender's presence —
+	// their request just landed, so they are no longer "asking the AI".
+	if data, e := json.Marshal(c); e == nil {
+		s.hub.Broadcast(cid, chathub.Event{Name: "conv", Data: data})
+	}
+	s.hub.SetPresence(cid, u.Username, "", "idle")
 	writeJSON(w, http.StatusOK, c)
+}
+
+// chatEvents is the live event stream for one conversation (Server-Sent Events): the conversation
+// itself on connect and on every new turn, plus presence ("who is typing / asking the AI"). Auth is
+// the session cookie the browser sends with the stream; operator access is enforced like everywhere.
+func (s *Server) chatEvents(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	srv, ok := s.controlled(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "Streaming unsupported")
+		return
+	}
+	cid := r.PathValue("cid")
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no") // ask any proxy not to buffer the stream
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	id, ch := s.hub.Subscribe(cid)
+	defer s.hub.Unsubscribe(cid, id)
+
+	// Snapshot on connect: the conversation as persisted, then who is currently active. A reconnecting
+	// client thus always re-syncs to the truth (the persisted conversation is authoritative).
+	if c, err := s.chats.Get(srv.ID, cid); err == nil {
+		if data, e := json.Marshal(c); e == nil {
+			writeSSE(w, flusher, "conv", data)
+		}
+	}
+	if data, e := json.Marshal(map[string]any{"present": s.hub.Presence(cid)}); e == nil {
+		writeSSE(w, flusher, "presence", data)
+	}
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, open := <-ch:
+			if !open {
+				return // dropped by the hub (slow consumer) — the client reconnects and re-snapshots
+			}
+			writeSSE(w, flusher, ev.Name, ev.Data)
+		}
+	}
+}
+
+// chatPresence records the caller's live activity ("typing" | "working" | "idle") in a conversation,
+// which the hub pushes to the others watching it. Stamped with the operator's in-game name so the
+// indicator reads "IchBinsHenry is typing…", not the username.
+func (s *Server) chatPresence(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	if _, ok := s.controlled(r, u); !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	var body struct {
+		State string `json:"state"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "Malformed request")
+		return
+	}
+	name := ""
+	if acc, ok := s.st.Account(u.Username); ok {
+		name = acc.Name
+	}
+	s.hub.SetPresence(r.PathValue("cid"), u.Username, name, body.State)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// writeSSE writes one Server-Sent Event and flushes it.
+func writeSSE(w http.ResponseWriter, f http.Flusher, name string, data []byte) {
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, data)
+	f.Flush()
 }
 
 // deleteChat removes one conversation. Any operator may delete one — it is their shared surface.

@@ -34,6 +34,8 @@ registerMessages({
     'hosuto.ai.pickOrNew': 'Start a new chat, or pick one on the left.',
     'hosuto.ai.deleteChat': 'Delete chat',
     'hosuto.ai.deleteChatTitle': 'Delete this chat for all operators?',
+    'hosuto.ai.typing': (v: MessageVars) => `${v.who} is typing…`,
+    'hosuto.ai.asking': (v: MessageVars) => `${v.who} is asking the AI…`,
 
     'hosuto.autostart': 'Autostart',
     'hosuto.autostartLabel': 'Mit dem System starten',
