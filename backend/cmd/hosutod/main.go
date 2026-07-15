@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"hosuto/internal/access"
+	"hosuto/internal/aigentic"
 	"hosuto/internal/api"
 	"hosuto/internal/auth"
 	"hosuto/internal/chathub"
@@ -25,6 +27,7 @@ import (
 	"hosuto/internal/contax"
 	"hosuto/internal/directory"
 	"hosuto/internal/hconfig"
+	"hosuto/internal/ingame"
 	"hosuto/internal/mcapi"
 	"hosuto/internal/mcp"
 	"hosuto/internal/modrinth"
@@ -108,6 +111,16 @@ func main() {
 	sk := skin.New("", nil)
 	mgr := runtime.New(st, cfg, rt, vc)
 
+	// The one authorisation rule (who may see/control/own a server) + the game-identity reverse index,
+	// shared by the HTTP surface and the in-game "!ai" CLI so neither duplicates the rule.
+	acc := access.New(st, cx, dir, v)
+
+	// aigentic is reached — like every sibling — through a client that degrades silently when it is not
+	// configured. It backs the in-game "!ai": hosuto runs a turn on the operator's own credential via
+	// aigentic's internal M2M endpoint (there is no browser in Minecraft to carry the session).
+	ai := aigentic.New(getenv("HOSUTO_AIGENTIC_URL", "http://127.0.0.1:8780"),
+		readSecret("HOSUTO_AIGENTIC_SECRET", "HOSUTO_AIGENTIC_SECRET_FILE"))
+
 	// Reconcile mc-router's live route table with the servers hosuto actually has. A crash between
 	// "delete the server" and "delete the route" would otherwise leave a public domain pointing at a
 	// port that is about to be handed to someone else's server — the one failure mode here that is
@@ -133,8 +146,18 @@ func main() {
 		}
 	}()
 
+	// The in-game "!ai" CLI: one supervisor goroutine tails each running server's log and answers in
+	// chat, running each turn through aigentic on the operator's own credential. It shares the store,
+	// runtime, the one access rule, the chats, the live hub and the MCP token mint with the HTTP
+	// surface — one data path, two front-ends. It idles cleanly when aigentic is not configured.
+	eng := ingame.New(ingame.Deps{
+		Store: st, Mgr: mgr, Access: acc, Chats: chats, Hub: hub, Tokens: tok, Aigentic: ai, Cfg: cfg,
+	})
+	igCtx, igCancel := context.WithCancel(context.Background())
+	go eng.Run(igCtx)
+
 	srv := &http.Server{
-		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk, tok, chats, hub).Handler(),
+		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk, tok, chats, hub, acc).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	// Bind synchronously so "address already in use" surfaces here, not inside a goroutine.
@@ -152,6 +175,7 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
+	igCancel() // stop the in-game followers before we tear the daemon down
 	shutdown, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelShutdown()
 	_ = srv.Shutdown(shutdown)

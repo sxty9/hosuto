@@ -437,3 +437,35 @@ func (m *Manager) Say(ctx context.Context, srv store.Server, msg string) {
 	defer c.Close()
 	_, _ = c.Cmd("say " + msg)
 }
+
+// Command runs one or more RCON commands over a SINGLE session and returns each reply in order. It is
+// the return-value sibling of Say: the in-game "!ai" CLI uses it to query the server (e.g. `list`) and
+// to answer the operator with chunked `tellraw` lines, all on one dial.
+//
+// The gate matches Say and ApplyWhitelist: a server that is not "active" to systemd, or is active but
+// whose RCON is not up yet (world still loading), is not an error — it yields (nil, false). A caller
+// that needs to know whether the commands actually ran reads ok; one that is fire-and-forget ignores
+// it. A mid-session RCON error stops the batch and returns what succeeded so far with that error. Each
+// command's payload must stay under the RCON frame limit (~1446 bytes); the caller chunks to fit.
+func (m *Manager) Command(ctx context.Context, srv store.Server, cmds ...string) (replies []string, ok bool, err error) {
+	if len(cmds) == 0 {
+		return nil, false, nil
+	}
+	if m.State(ctx, srv) != "active" {
+		return nil, false, nil
+	}
+	c, derr := m.rcon(srv)
+	if derr != nil {
+		return nil, false, nil // running but rcon not up yet (world still loading)
+	}
+	defer c.Close()
+	replies = make([]string, 0, len(cmds))
+	for _, cmd := range cmds {
+		reply, cerr := c.Cmd(cmd)
+		if cerr != nil {
+			return replies, true, cerr
+		}
+		replies = append(replies, reply)
+	}
+	return replies, true, nil
+}

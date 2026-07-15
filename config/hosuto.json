@@ -76,6 +76,49 @@
           "default": "sxty9/hosuto (holistic services landscape)"
         }
       ]
+    },
+    {
+      "id": "ingame",
+      "label": "In-game AI",
+      "description": "The !ai chat command that lets operators drive a server with the AI from inside Minecraft.",
+      "settings": [
+        {
+          "id": "ingameEnabled",
+          "label": "Enable the in-game !ai command",
+          "type": "bool",
+          "default": true
+        },
+        {
+          "id": "ingameTrigger",
+          "label": "Chat trigger",
+          "type": "string",
+          "default": "!ai"
+        },
+        {
+          "id": "ingameReplyPrivate",
+          "label": "Answer only the asking player",
+          "type": "bool",
+          "default": true
+        },
+        {
+          "id": "ingameInterval",
+          "label": "Server scan interval (s)",
+          "type": "int",
+          "default": 10
+        },
+        {
+          "id": "ingameAiTimeout",
+          "label": "AI answer timeout (s)",
+          "type": "int",
+          "default": 120
+        },
+        {
+          "id": "ingameTokenTTLMin",
+          "label": "AI tool-token lifetime (min)",
+          "type": "int",
+          "default": 5
+        }
+      ]
     }
   ]
 }

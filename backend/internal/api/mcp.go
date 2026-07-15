@@ -58,7 +58,7 @@ func (s *Server) authenticateMCP(r *http.Request) (any, error) {
 // mcpTarget resolves the server a tool acts on, from the connection's bound scope and/or an explicit
 // "server" argument, and checks the caller's access at the required level. This is the single choke
 // point every tool passes through.
-func (s *Server) mcpTarget(ctx context.Context, c *mcpCaller, ref string, level access) (store.Server, error) {
+func (s *Server) mcpTarget(ctx context.Context, c *mcpCaller, ref string, level accessLevel) (store.Server, error) {
 	if ref == "" {
 		ref = c.scope
 	}

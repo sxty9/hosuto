@@ -10,20 +10,21 @@ import (
 	"os"
 	"path/filepath"
 
+	"hosuto/internal/access"
 	"hosuto/internal/auth"
-	"hosuto/internal/rights"
 	"hosuto/internal/runtime"
 	"hosuto/internal/store"
 )
 
-// access is the level a caller must hold for an operation. It mirrors the three gates the REST
-// surface already enforces: see a server, control (start/stop) it, or own it.
-type access int
+// The access level a caller must hold for an operation — the three gates the REST surface enforces.
+// The rule itself lives in package access (shared with the in-game CLI); these are local aliases so
+// every call site here reads accessVisible/Control/Owned unchanged.
+type accessLevel = access.Level
 
 const (
-	accessVisible access = iota // owner, admin, or any resolved member
-	accessControl               // owner, admin, or an op-level member
-	accessOwned                 // owner or admin only
+	accessVisible = access.Visible // owner, admin, or any resolved member
+	accessControl = access.Control // owner, admin, or an op-level member
+	accessOwned   = access.Owned   // owner or admin only
 )
 
 // findServer resolves a server by id (srv-…) or by slug. A slug is accepted because it is what a
@@ -43,25 +44,10 @@ func (s *Server) findServer(ref string) (store.Server, bool) {
 	return store.Server{}, false
 }
 
-// hasAccess is the one authorisation rule both surfaces share. Membership is resolved live (never
-// copied), exactly as the REST handlers do.
-func (s *Server) hasAccess(ctx context.Context, srv store.Server, u *auth.User, level access) bool {
-	owner := srv.Owner == u.Username || u.Can(rights.GroupAdmin)
-	switch level {
-	case accessOwned:
-		return owner
-	case accessControl:
-		if owner {
-			return true
-		}
-		return s.resolve(ctx, srv)[u.Username] == "op"
-	default: // accessVisible
-		if owner {
-			return true
-		}
-		_, member := s.resolve(ctx, srv)[u.Username]
-		return member
-	}
+// hasAccess / resolve delegate to the shared resolver so the api handlers and the in-game CLI run one
+// implementation.
+func (s *Server) hasAccess(ctx context.Context, srv store.Server, u *auth.User, level accessLevel) bool {
+	return s.acc.HasAccess(ctx, srv, u, level)
 }
 
 // installMod resolves a Modrinth project against the server's version/loader, downloads the jar into

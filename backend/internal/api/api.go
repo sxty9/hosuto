@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"hosuto/internal/access"
 	"hosuto/internal/auth"
 	"hosuto/internal/chathub"
 	"hosuto/internal/chatstore"
@@ -67,6 +68,7 @@ type Server struct {
 	tok   *mcp.TokenStore
 	chats *chatstore.Store
 	hub   *chathub.Hub
+	acc   *access.Resolver
 	http  *http.Client
 }
 
@@ -74,9 +76,9 @@ type Server struct {
 func New(v *auth.Verifier, st *store.Store, cfg *hconfig.Config, rt *runtime.Manager,
 	dir *directory.Directory, cx *contax.Client, nt *notify.Client, mc *mcapi.Client,
 	mr *modrinth.Client, vc *versions.Client, sk *skin.Renderer, tok *mcp.TokenStore,
-	chats *chatstore.Store, hub *chathub.Hub) *Server {
+	chats *chatstore.Store, hub *chathub.Hub, acc *access.Resolver) *Server {
 	return &Server{v: v, st: st, cfg: cfg, rt: rt, dir: dir, cx: cx, nt: nt, mc: mc, mr: mr, vc: vc,
-		skin: sk, tok: tok, chats: chats, hub: hub, http: &http.Client{Timeout: 60 * time.Second}}
+		skin: sk, tok: tok, chats: chats, hub: hub, acc: acc, http: &http.Client{Timeout: 60 * time.Second}}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -799,39 +801,10 @@ func (s *Server) fsUpload(w http.ResponseWriter, r *http.Request, u *auth.User) 
 // only the grant that points at them. Copying would be exactly the parallel data path the Single
 // Source of Truth maxim forbids — and it would go stale the moment someone leaves a group.
 //
-// "op" wins over "play" when a user is reachable through more than one grant.
+// "op" wins over "play" when a user is reachable through more than one grant. The rule lives in
+// package access (shared with the in-game CLI); this is a shim so every call site here is unchanged.
 func (s *Server) resolve(ctx context.Context, srv store.Server) map[string]string {
-	out := map[string]string{}
-	set := func(user, level string) {
-		if user == "" || user == srv.Owner {
-			return
-		}
-		if out[user] == "op" {
-			return
-		}
-		out[user] = level
-	}
-	for _, g := range srv.Grants {
-		switch g.Kind {
-		case "adhoc":
-			for _, m := range g.Members {
-				set(m, g.Level)
-			}
-		case "contax":
-			// A contax lookup that fails (contax down, secret unset) resolves to NO members rather
-			// than to stale ones. Failing closed here means a member briefly loses access; failing
-			// open would mean someone removed from a group keeps it. The former is recoverable.
-			members, _ := s.cx.Members(g.Ref)
-			for _, m := range members {
-				set(m, g.Level)
-			}
-		case "holistic":
-			for _, m := range s.dir.GroupMembers(g.Ref) {
-				set(m, g.Level)
-			}
-		}
-	}
-	return out
+	return s.acc.Resolve(ctx, srv)
 }
 
 // canAdd decides whether `actor` may add `target` to a server.
