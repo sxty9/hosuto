@@ -1,16 +1,17 @@
-// AskAi is hosuto's "Ask AI" tab: the same chat the aigentic service gives you, but bound to ONE
-// game server and wired to hosuto's tools. It is a duplicate of aigentic's ChatView (message
-// bubbles, a composer, Markdown answers, a "Working…" spinner — aigentic's chat does not stream, and
-// neither does this) with two differences that make it agentic:
+// AskAi is hosuto's "Ask AI" tab: aigentic's chat, bound to ONE server and wired to hosuto's tools.
 //
-//   1. On the first send it mints a short-lived MCP token from hosuto, scoped to THIS server.
-//   2. Each turn goes to aigentic's /run on the claude-cli engine with that token attached as an MCP
-//      server plus a system prompt describing the server — so the model can actually operate it
-//      (status, start/stop, whitelist, mods, files, logs) through hosuto's MCP tools.
+// Two things make it more than a private chat:
+//   1. The thread is SHARED and PERSISTENT. It lives in hosuto (GET/POST servers/<id>/chat), so it
+//      survives reloads and every operator of the server sees the same history — polled live, and
+//      each user turn labelled with who asked. Operators = owner, admin, op-level members; the tab
+//      is gated on exactly that (canControl), the same people who may start and stop the server.
+//   2. It is agentic. On send it mints a short-lived, server-scoped MCP token and hands it to
+//      aigentic's claude-cli engine, so the model can actually operate the server (status, start/
+//      stop, whitelist, mods, files, logs) through hosuto's MCP tools.
 //
-// Everything else — the user's own Claude billing (subscription or API key), engine execution, the
-// agentic tool loop — lives in aigentic. hosuto only supplies the tools and the binding. That is the
-// Reuse-before-Build and Single-Source-of-Truth split the whole feature is built on.
+// The model call itself runs in the browser, billed to the sending operator's own aigentic account
+// (subscription or API key). hosuto only records the exchange in the shared thread — the split that
+// keeps the LLM in aigentic and the server chat in hosuto.
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import {
   Badge,
@@ -23,58 +24,55 @@ import {
   Stack,
   Text,
   Textarea,
+  useLiveQuery,
   useT,
   type ServiceContextProps,
 } from '@holistic/ui';
-import type { ServerView } from './types';
+import type { ChatMsg, ChatResp, ServerView } from './types';
 
-interface Msg {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-// The aigentic result envelope (a prizm Response whose Data is the aigentic Result). Only the
-// fields this tab reads are typed.
+// The aigentic result envelope (a prizm Response whose Data is the aigentic Result).
 interface RunResponse {
-  data: { output: string; engine?: string; model?: string };
+  data: { output: string };
 }
 
 const SCROLL_ID = 'hosuto-ai-scroll';
 const scrollEl = () => document.getElementById(SCROLL_ID);
 
-// clean strips the trailing "Assistant:" the model may echo back from the transcript, plus any
-// stray context tags — mirroring aigentic's own clean().
+// clean strips the trailing "Assistant:" the model may echo back from the transcript.
 function clean(s: string): string {
   return s.replace(/^\s*Assistant:\s*/i, '').trim();
 }
 
-// systemPrompt binds the chat to this server. The tools describe themselves; this only sets the
-// scene and the house rules (confirm before anything disruptive, this connection is already bound).
 function systemPrompt(srv: ServerView): string {
   return [
     `You are the assistant for the Minecraft server "${srv.name}" (address ${srv.host}, Minecraft ${srv.mcVersion}, loader ${srv.loader}).`,
     `You can inspect and operate THIS server through the hosuto tools: status, players, logs, start/stop/restart, autostart, whitelist, join policy, mods and files.`,
     `This connection is already bound to this server, so you may omit the "server" argument on every tool.`,
-    `Prefer calling a tool over guessing. Before anything disruptive — stopping or restarting the server, removing a mod, or removing a member — confirm with the user first.`,
+    `This is a shared operator chat — more than one person may be talking to you. Prefer calling a tool over guessing. Before anything disruptive — stopping or restarting the server, removing a mod, or removing a member — confirm with the user first.`,
     `Answer concisely, in the user's language.`,
   ].join(' ');
 }
 
-export function AskAi({ api, apiFor, ui, srv }: Pick<ServiceContextProps, 'api' | 'apiFor' | 'ui'> & { srv: ServerView }) {
+export function AskAi({ api, apiFor, ui, user, srv }: Pick<ServiceContextProps, 'api' | 'apiFor' | 'ui' | 'user'> & { srv: ServerView }) {
   const t = useT();
-  const [messages, setMessages] = useState<Msg[]>([]);
+  // The shared thread, polled so operators see each other's turns land.
+  const q = useLiveQuery<ChatResp>(() => api.get<ChatResp>(`servers/${srv.id}/chat`), 5000, [srv.id]);
+  const history: ChatMsg[] = q.data?.messages ?? [];
+
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
-  // The MCP token is minted once per session, scoped to this server, and reused across turns.
+  // The operator's own turn, shown optimistically until the shared thread reflects it.
+  const [pending, setPending] = useState<string | null>(null);
   const tokenRef = useRef<string | null>(null);
   const prevLen = useRef(0);
 
-  // A new message (sent or received) jumps to the bottom; the "Working…" row stays in view.
+  // A new message (loaded, sent, or received) jumps to the bottom; the "Working…" row stays in view.
   useEffect(() => {
     const el = scrollEl();
-    if (el && (messages.length > prevLen.current || busy)) el.scrollTop = el.scrollHeight;
-    prevLen.current = messages.length;
-  }, [messages, busy]);
+    const total = history.length + (pending ? 1 : 0);
+    if (el && (total > prevLen.current || busy)) el.scrollTop = el.scrollHeight;
+    prevLen.current = total;
+  }, [history.length, pending, busy]);
 
   async function mcpToken(): Promise<string> {
     if (tokenRef.current) return tokenRef.current;
@@ -86,26 +84,27 @@ export function AskAi({ api, apiFor, ui, srv }: Pick<ServiceContextProps, 'api' 
   async function send() {
     const text = input.trim();
     if (!text || busy) return;
-    const next: Msg[] = [...messages, { role: 'user', content: text }];
-    setMessages(next);
+    setPending(text);
     setInput('');
     setBusy(true);
     try {
       const token = await mcpToken();
-      // The whole conversation is sent as one transcript; the model continues after "Assistant:".
-      const transcript = next.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n') + '\n\nAssistant:';
+      // The whole shared thread plus this turn is sent as one transcript; the model continues after
+      // "Assistant:". It sees every operator's turns, which is the point of a shared chat.
+      const transcript =
+        [...history, { role: 'user', content: text }].map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n\n') + '\n\nAssistant:';
       const res = await apiFor('aigentic').post<RunResponse>('run', {
         header: { kind: 'claude-cli' },
-        data: {
-          prompt: transcript,
-          system: systemPrompt(srv),
-          mcp: [{ name: 'hosuto', token }],
-        },
+        data: { prompt: transcript, system: systemPrompt(srv), mcp: [{ name: 'hosuto', token }] },
       });
-      setMessages([...next, { role: 'assistant', content: clean(res.data.output) }]);
+      const answer = clean(res.data.output);
+      // Persist the exchange to the shared thread, then refresh so it (and anyone else's turns) show.
+      await api.post(`servers/${srv.id}/chat`, { user: text, assistant: answer });
+      setPending(null);
+      q.refresh();
     } catch (e) {
+      setPending(null);
       const msg = (e as Error).message || '';
-      // The claude-cli engine is unavailable when the user has connected no Claude credential.
       const description = /unavailable|credential|subscription|no Claude/i.test(msg) ? t('hosuto.ai.noEngine') : msg;
       ui.toast({ title: t('hosuto.ai.failed'), description, variant: 'error' });
     } finally {
@@ -120,24 +119,38 @@ export function AskAi({ api, apiFor, ui, srv }: Pick<ServiceContextProps, 'api' 
     }
   }
 
+  const empty = history.length === 0 && !pending;
+
   return (
     <Stack gap={3} className="h-full">
       <ScrollArea id={SCROLL_ID} className="grow max-h-[58vh] min-h-[30vh] pr-1">
-        {messages.length === 0 ? (
+        {empty ? (
           <EmptyState title={srv.name} description={t('hosuto.ai.empty')} />
         ) : (
           <Stack gap={4}>
-            {messages.map((m, i) =>
+            {history.map((m, i) =>
               m.role === 'user' ? (
-                <Box key={i} className="self-end max-w-[85%] rounded-md bg-accent/15 px-3 py-2">
-                  <Text className="whitespace-pre-wrap leading-relaxed">{m.content}</Text>
-                </Box>
+                <Stack key={i} gap={1} align="end">
+                  {m.author && m.author !== user.username && (
+                    <Text variant="caption" color="tertiary">
+                      {m.author}
+                    </Text>
+                  )}
+                  <Box className="self-end max-w-[85%] rounded-md bg-accent/15 px-3 py-2">
+                    <Text className="whitespace-pre-wrap leading-relaxed">{m.content}</Text>
+                  </Box>
+                </Stack>
               ) : (
                 <Stack key={i} gap={1} className="max-w-full">
                   <Badge variant="accent">AI</Badge>
                   {m.content ? <Markdown text={m.content} /> : <Text color="secondary">{t('hosuto.ai.emptyReply')}</Text>}
                 </Stack>
               ),
+            )}
+            {pending && (
+              <Box className="self-end max-w-[85%] rounded-md bg-accent/15 px-3 py-2 opacity-70">
+                <Text className="whitespace-pre-wrap leading-relaxed">{pending}</Text>
+              </Box>
             )}
           </Stack>
         )}

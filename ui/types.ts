@@ -160,3 +160,15 @@ export interface CatalogModsResp {
 }
 
 export type Tab = 'reach' | 'players' | 'modding' | 'files' | 'ai' | 'export';
+
+// One turn in a server's shared "Ask AI" thread. Persisted by hosuto, visible to every operator of
+// the server; a user turn carries the author so the shared log shows who asked.
+export interface ChatMsg {
+  role: 'user' | 'assistant';
+  content: string;
+  author?: string;
+  ts: number;
+}
+export interface ChatResp {
+  messages: ChatMsg[];
+}

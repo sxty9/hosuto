@@ -135,7 +135,9 @@ function ServerScreen({ serverId, wanted, canPlay, canHost, canAdmin, ...props }
   // added to — that is what "op" means to the people using it, and the backend agrees.
   const canControl = srv.owned || canAdmin || srv.level === 'op';
 
-  const canAskAi = userHasRight(props.user, AI);
+  // The Ask AI chat is a shared OPERATOR surface (persisted, seen by everyone who can run the
+  // server), so it is offered to operators — canControl — who also hold the AI-service right.
+  const canAskAi = canControl && userHasRight(props.user, AI);
 
   const options: SegmentedOption<Tab>[] = [{ value: 'reach', label: t('hosuto.tabReach') }];
   if (canManage) {

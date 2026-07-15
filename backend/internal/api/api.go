@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"hosuto/internal/auth"
+	"hosuto/internal/chatstore"
 	"hosuto/internal/contax"
 	"hosuto/internal/directory"
 	"hosuto/internal/export"
@@ -51,27 +52,29 @@ const (
 
 // Server is the HTTP layer.
 type Server struct {
-	v    *auth.Verifier
-	st   *store.Store
-	cfg  *hconfig.Config
-	rt   *runtime.Manager
-	dir  *directory.Directory
-	cx   *contax.Client
-	nt   *notify.Client
-	mc   *mcapi.Client
-	mr   *modrinth.Client
-	vc   *versions.Client
-	skin *skin.Renderer
-	tok  *mcp.TokenStore
-	http *http.Client
+	v     *auth.Verifier
+	st    *store.Store
+	cfg   *hconfig.Config
+	rt    *runtime.Manager
+	dir   *directory.Directory
+	cx    *contax.Client
+	nt    *notify.Client
+	mc    *mcapi.Client
+	mr    *modrinth.Client
+	vc    *versions.Client
+	skin  *skin.Renderer
+	tok   *mcp.TokenStore
+	chats *chatstore.Store
+	http  *http.Client
 }
 
 // New wires the HTTP layer.
 func New(v *auth.Verifier, st *store.Store, cfg *hconfig.Config, rt *runtime.Manager,
 	dir *directory.Directory, cx *contax.Client, nt *notify.Client, mc *mcapi.Client,
-	mr *modrinth.Client, vc *versions.Client, sk *skin.Renderer, tok *mcp.TokenStore) *Server {
+	mr *modrinth.Client, vc *versions.Client, sk *skin.Renderer, tok *mcp.TokenStore,
+	chats *chatstore.Store) *Server {
 	return &Server{v: v, st: st, cfg: cfg, rt: rt, dir: dir, cx: cx, nt: nt, mc: mc, mr: mr, vc: vc,
-		skin: sk, tok: tok, http: &http.Client{Timeout: 60 * time.Second}}
+		skin: sk, tok: tok, chats: chats, http: &http.Client{Timeout: 60 * time.Second}}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -146,6 +149,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+base+"mcp/token", s.guard(rights.GroupPlay, true, s.mintMCPToken))
 	mux.HandleFunc("GET "+base+"mcp/token", s.guard(rights.GroupPlay, false, s.mcpTokenStatus))
 	mux.HandleFunc("DELETE "+base+"mcp/token", s.guard(rights.GroupPlay, true, s.revokeMCPToken))
+
+	// The "Ask AI" chat is a SHARED thread per server, persisted here and visible to every operator
+	// of the server. The coarse right gates the route; controlled() enforces operator access (owner,
+	// admin, or an op-level member) inside every handler — the same rule that gates start/stop.
+	mux.HandleFunc("GET "+base+"servers/{id}/chat", s.guard(rights.GroupPlay, false, s.getChat))
+	mux.HandleFunc("POST "+base+"servers/{id}/chat", s.guard(rights.GroupPlay, true, s.postChat))
+	mux.HandleFunc("DELETE "+base+"servers/{id}/chat", s.guard(rights.GroupPlay, true, s.clearChat))
 
 	return mux
 }
@@ -490,6 +500,7 @@ func (s *Server) deleteServer(w http.ResponseWriter, r *http.Request, u *auth.Us
 		writeErr(w, http.StatusInternalServerError, "Could not remove the server")
 		return
 	}
+	_ = s.chats.Delete(srv.ID) // the shared thread goes with the server it belonged to
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
