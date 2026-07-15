@@ -17,7 +17,17 @@ registerMessages({
     'hosuto.tabPlayers': 'Players',
     'hosuto.tabModding': 'Version & Mods',
     'hosuto.tabFiles': 'Game files',
+    'hosuto.tabAi': 'Ask AI',
     'hosuto.tabExport': 'Client Export',
+
+    // ── Ask AI (agentic chat bound to this server) ──
+    'hosuto.ai.empty': 'Ask about this server — I can check its status, players and logs, start or stop it, manage the whitelist, mods and files.',
+    'hosuto.ai.placeholder': 'Message the AI…  (Enter to send, Shift+Enter for a new line)',
+    'hosuto.ai.thinking': 'Working…',
+    'hosuto.ai.emptyReply': '(no answer)',
+    'hosuto.ai.failed': 'The AI request failed',
+    'hosuto.ai.noEngine': 'Connect your Claude account in the AI service (Aigentic) to use this.',
+
     'hosuto.autostart': 'Autostart',
     'hosuto.autostartLabel': 'Mit dem System starten',
     'hosuto.autostartOn': 'Autostart an',

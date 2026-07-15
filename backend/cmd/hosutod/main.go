@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"hosuto/internal/directory"
 	"hosuto/internal/hconfig"
 	"hosuto/internal/mcapi"
+	"hosuto/internal/mcp"
 	"hosuto/internal/modrinth"
 	"hosuto/internal/notify"
 	"hosuto/internal/router"
@@ -68,6 +70,13 @@ func main() {
 	st, err := store.Open(*statePath)
 	if err != nil {
 		log.Fatalf("hosutod: state: %v", err)
+	}
+
+	// MCP bearer tokens live beside the state file (same 0600, same owner). They let external MCP
+	// clients — and the Ask AI chat via aigentic — authenticate to hosuto's tool endpoint.
+	tok, err := mcp.OpenTokenStore(filepath.Join(filepath.Dir(*statePath), "mcp-tokens.json"))
+	if err != nil {
+		log.Fatalf("hosutod: mcp tokens: %v", err)
 	}
 
 	// Admin configuration comes from the central Configuration tab, not from hosuto's own UI: the
@@ -117,7 +126,7 @@ func main() {
 	}()
 
 	srv := &http.Server{
-		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk).Handler(),
+		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk, tok).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	// Bind synchronously so "address already in use" surfaces here, not inside a goroutine.

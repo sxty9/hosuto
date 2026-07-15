@@ -109,6 +109,18 @@ func (v *Verifier) User(r *http.Request) (*User, error) {
 	return &User{Username: sub, Groups: groups, IsAdmin: contains(groups, v.adminGroup)}, nil
 }
 
+// Resolve builds a User for a username whose identity was established out of band — an MCP bearer
+// token, not a session cookie. Groups and admin are still read LIVE from the OS, exactly as User()
+// does for a cookie: the token only names WHO the caller is, never WHAT they may do. Reports ok=false
+// if the account no longer exists (parity with User(), which 401s a deleted account).
+func (v *Verifier) Resolve(username string) (*User, bool) {
+	groups, exists := resolveGroups(username)
+	if !exists {
+		return nil, false
+	}
+	return &User{Username: username, Groups: groups, IsAdmin: contains(groups, v.adminGroup)}, true
+}
+
 // CheckCSRF enforces the double-submit guard: header X-CSRF-Token must equal the
 // readable h_csrf cookie. Required on mutating requests; not on GETs.
 func (v *Verifier) CheckCSRF(r *http.Request) bool {

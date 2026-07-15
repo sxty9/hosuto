@@ -33,6 +33,7 @@ import (
 	"hosuto/internal/hconfig"
 	"hosuto/internal/mcapi"
 	"hosuto/internal/mcfiles"
+	"hosuto/internal/mcp"
 	"hosuto/internal/modrinth"
 	"hosuto/internal/notify"
 	"hosuto/internal/rights"
@@ -61,15 +62,16 @@ type Server struct {
 	mr   *modrinth.Client
 	vc   *versions.Client
 	skin *skin.Renderer
+	tok  *mcp.TokenStore
 	http *http.Client
 }
 
 // New wires the HTTP layer.
 func New(v *auth.Verifier, st *store.Store, cfg *hconfig.Config, rt *runtime.Manager,
 	dir *directory.Directory, cx *contax.Client, nt *notify.Client, mc *mcapi.Client,
-	mr *modrinth.Client, vc *versions.Client, sk *skin.Renderer) *Server {
+	mr *modrinth.Client, vc *versions.Client, sk *skin.Renderer, tok *mcp.TokenStore) *Server {
 	return &Server{v: v, st: st, cfg: cfg, rt: rt, dir: dir, cx: cx, nt: nt, mc: mc, mr: mr, vc: vc,
-		skin: sk, http: &http.Client{Timeout: 60 * time.Second}}
+		skin: sk, tok: tok, http: &http.Client{Timeout: 60 * time.Second}}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -136,6 +138,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"servers/{id}/export/mods", s.guard(rights.GroupPlay, false, s.exportMods))
 	mux.HandleFunc("GET "+base+"servers/{id}/export/mrpack", s.guard(rights.GroupPlay, false, s.exportMrpack))
 	mux.HandleFunc("GET "+base+"servers/{id}/export/prism", s.guard(rights.GroupPlay, false, s.exportPrism))
+
+	// The MCP surface. The endpoint itself speaks JSON-RPC and authenticates a bearer token or the
+	// session cookie inside the handler (see authenticateMCP), so it is mounted raw, not behind guard.
+	// The token routes that mint/list/revoke those bearer tokens ARE behind guard, like any other API.
+	mux.Handle(base+"mcp", s.mcp().Handler(s.authenticateMCP))
+	mux.HandleFunc("POST "+base+"mcp/token", s.guard(rights.GroupPlay, true, s.mintMCPToken))
+	mux.HandleFunc("GET "+base+"mcp/token", s.guard(rights.GroupPlay, false, s.mcpTokenStatus))
+	mux.HandleFunc("DELETE "+base+"mcp/token", s.guard(rights.GroupPlay, true, s.revokeMCPToken))
 
 	return mux
 }
@@ -1017,18 +1027,11 @@ func (s *Server) setPolicy(w http.ResponseWriter, r *http.Request, u *auth.User)
 		writeErr(w, http.StatusBadRequest, "Unknown join policy")
 		return
 	}
-	srv.JoinPolicy = body.JoinPolicy
-	if err := s.st.UpdateServer(srv); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not save the policy")
-		return
-	}
-	if err := s.rt.SyncConfig(r.Context(), srv); err != nil {
+	srv, err := s.applyPolicy(r.Context(), srv, body.JoinPolicy)
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// white-list is read at startup, so a running server needs a restart to pick the change up. Say
-	// so on the server rather than pretending it took effect.
-	s.rt.Say(r.Context(), srv, "hosuto: join policy is now "+body.JoinPolicy+" (restart to apply)")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"joinPolicy": srv.JoinPolicy, "restartRequired": true,
 	})
@@ -1058,10 +1061,6 @@ func (s *Server) addMod(w http.ResponseWriter, r *http.Request, u *auth.User) {
 		writeErr(w, http.StatusNotFound, "No such server")
 		return
 	}
-	if !store.LoaderHasClientMods(srv.Loader) {
-		writeErr(w, http.StatusBadRequest, "This server's loader does not run mods")
-		return
-	}
 	var body struct {
 		ProjectID string `json:"projectId"`
 	}
@@ -1069,39 +1068,9 @@ func (s *Server) addMod(w http.ResponseWriter, r *http.Request, u *auth.User) {
 		writeErr(w, http.StatusBadRequest, "Malformed request")
 		return
 	}
-	ver, hit, err := s.mr.Resolve(r.Context(), body.ProjectID, srv.MCVersion, srv.Loader)
+	m, err := s.installMod(r.Context(), srv, body.ProjectID)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "No build of that mod for this version and loader")
-		return
-	}
-	// A mod the server cannot run must never be installed on it. (The mirror rule — a mod the client
-	// cannot run must never be exported — lives in the export package.)
-	if hit.ServerSide == "unsupported" {
-		writeErr(w, http.StatusBadRequest, "That mod is client-only — it does not belong on the server")
-		return
-	}
-	file := primary(ver)
-	if file.URL == "" {
-		writeErr(w, http.StatusBadGateway, "That mod has no downloadable file")
-		return
-	}
-	dir := filepath.Join(runtime.Dir(srv.Owner, srv.Slug), "mods")
-	if err := os.MkdirAll(dir, 0o770); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not create the mods folder")
-		return
-	}
-	if err := s.mr.Download(r.Context(), file, filepath.Join(dir, file.Filename)); err != nil {
-		writeErr(w, http.StatusBadGateway, "Could not download the mod")
-		return
-	}
-	m, err := s.st.AddMod(srv.ID, store.Mod{
-		Source: "modrinth", ProjectID: hit.ProjectID, VersionID: ver.ID,
-		Name: hit.Title, Filename: file.Filename, URL: file.URL,
-		SHA1: file.SHA1, SHA512: file.SHA512, Size: file.Size,
-		ClientSide: orUnknown(hit.ClientSide), ServerSide: orUnknown(hit.ServerSide),
-	})
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not record the mod")
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, m)
@@ -1136,12 +1105,10 @@ func (s *Server) removeMod(w http.ResponseWriter, r *http.Request, u *auth.User)
 		writeErr(w, http.StatusNotFound, "No such server")
 		return
 	}
-	m, err := s.st.RemoveMod(srv.ID, r.PathValue("modId"))
-	if err != nil {
+	if err := s.uninstallMod(r.Context(), srv, r.PathValue("modId")); err != nil {
 		writeErr(w, http.StatusNotFound, "No such mod")
 		return
 	}
-	_ = os.Remove(filepath.Join(runtime.Dir(srv.Owner, srv.Slug), "mods", m.Filename))
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

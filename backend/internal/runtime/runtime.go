@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -371,6 +372,57 @@ func (m *Manager) ApplyWhitelist(ctx context.Context, srv store.Server, players 
 	defer c.Close()
 	_, _ = c.Cmd("whitelist reload")
 	return nil
+}
+
+// LogTail returns the last n lines of the server's latest.log.
+//
+// It reads the file directly rather than shelling out to journalctl: the tree is <owner>:hosuto and
+// the daemon is in the group, so the log is readable without escalation — whereas an unprivileged
+// process has no guaranteed access to the systemd journal. The file is the same one the console shows.
+func (m *Manager) LogTail(srv store.Server, lines int) (string, error) {
+	if lines <= 0 || lines > 2000 {
+		lines = 200
+	}
+	return tailFile(filepath.Join(Dir(srv.Owner, srv.Slug), "logs", "latest.log"), lines)
+}
+
+// tailFile returns the last `lines` lines of a file. It reads at most the final 64 KiB — a crash log
+// worth reading is never further back than that, and it keeps a multi-hundred-megabyte latest.log from
+// being slurped whole.
+func tailFile(path string, lines int) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	const window = 64 << 10
+	var off int64
+	if info.Size() > window {
+		off = info.Size() - window
+	}
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return "", err
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return "", err
+	}
+	text := string(b)
+	// When we started mid-file, the first line is a fragment — drop it.
+	if off > 0 {
+		if i := strings.IndexByte(text, '\n'); i >= 0 {
+			text = text[i+1:]
+		}
+	}
+	all := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	if len(all) > lines {
+		all = all[len(all)-lines:]
+	}
+	return strings.Join(all, "\n"), nil
 }
 
 // Say sends a chat line to a running server (used to tell players a change landed).

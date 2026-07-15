@@ -159,4 +159,4 @@ export interface CatalogModsResp {
   mods: ModHit[];
 }
 
-export type Tab = 'reach' | 'players' | 'modding' | 'files' | 'export';
+export type Tab = 'reach' | 'players' | 'modding' | 'files' | 'ai' | 'export';

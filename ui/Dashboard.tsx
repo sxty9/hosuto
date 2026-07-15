@@ -41,11 +41,15 @@ import { Players } from './Players';
 import { Modding } from './Modding';
 import { ClientExport } from './ClientExport';
 import { Files } from './Files';
+import { AskAi } from './AskAi';
 import type { ServerView, Tab } from './types';
 
 const PLAY = 'hp_hosuto_play';
 const HOST = 'hp_hosuto_host';
 const ADMIN = 'hp_hosuto_admin';
+// Ask AI runs on the aigentic service, so it needs aigentic's run right — resolved from the same
+// shared identity (the user's Linux groups), so hosuto can gate the tab without asking aigentic.
+const AI = 'hp_aigentic_run';
 
 export function Dashboard(props: ServiceContextProps) {
   const { user, nav } = props;
@@ -131,12 +135,15 @@ function ServerScreen({ serverId, wanted, canPlay, canHost, canAdmin, ...props }
   // added to — that is what "op" means to the people using it, and the backend agrees.
   const canControl = srv.owned || canAdmin || srv.level === 'op';
 
+  const canAskAi = userHasRight(props.user, AI);
+
   const options: SegmentedOption<Tab>[] = [{ value: 'reach', label: t('hosuto.tabReach') }];
   if (canManage) {
     options.push({ value: 'players', label: t('hosuto.tabPlayers') });
     options.push({ value: 'modding', label: t('hosuto.tabModding') });
     options.push({ value: 'files', label: t('hosuto.tabFiles') });
   }
+  if (canAskAi) options.push({ value: 'ai', label: t('hosuto.tabAi') });
   if (canPlay) options.push({ value: 'export', label: t('hosuto.tabExport') });
 
   const tab: Tab = options.some((o) => o.value === wanted) ? wanted : 'reach';
@@ -162,6 +169,7 @@ function ServerScreen({ serverId, wanted, canPlay, canHost, canAdmin, ...props }
       {tab === 'players' && canManage && <Players {...props} srv={srv} />}
       {tab === 'modding' && canManage && <Modding {...props} srv={srv} onChanged={q.refresh} />}
       {tab === 'files' && canManage && <Files {...props} srv={srv} />}
+      {tab === 'ai' && canAskAi && <AskAi {...props} srv={srv} />}
       {tab === 'export' && canPlay && <ClientExport {...props} srv={srv} />}
     </Stack>
   );
