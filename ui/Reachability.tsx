@@ -12,6 +12,7 @@ import {
   Panel,
   Spinner,
   Stack,
+  Switch,
   Text,
   cn,
   useLiveQuery,
@@ -43,10 +44,25 @@ export function Reachability({
   const t = useT();
   const q = useLiveQuery<Status>(() => api.get<Status>(`servers/${srv.id}/status`), 5000, [srv.id]);
   const [busy, setBusy] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
 
   const st = q.data;
   const state: RunState = st?.state ?? srv.status?.state ?? 'inactive';
   const running = state === 'active' || state === 'activating';
+  const autostart = st?.autostart ?? srv.status?.autostart ?? false;
+
+  async function toggleAutostart(next: boolean) {
+    setAutostartBusy(true);
+    try {
+      await api.put(`servers/${srv.id}/autostart`, { enabled: next });
+      ui.toast({ title: next ? t('hosuto.autostartOn') : t('hosuto.autostartOff'), variant: 'success' });
+      q.refresh();
+    } catch (e) {
+      ui.toast({ title: t('hosuto.actionFailed'), description: (e as Error).message, variant: 'error' });
+    } finally {
+      setAutostartBusy(false);
+    }
+  }
 
   async function act(action: Action) {
     setBusy(true);
@@ -121,6 +137,12 @@ export function Reachability({
           )}
         </Stack>
       </Panel>
+
+      {srv.owned && (
+        <Panel title={t('hosuto.autostart')} className="p-4">
+          <Switch checked={autostart} disabled={autostartBusy} label={t('hosuto.autostartLabel')} onChange={(v) => void toggleAutostart(v)} />
+        </Panel>
+      )}
     </Stack>
   );
 }

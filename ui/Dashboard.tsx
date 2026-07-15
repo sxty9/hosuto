@@ -40,6 +40,7 @@ import { Reachability } from './Reachability';
 import { Players } from './Players';
 import { Modding } from './Modding';
 import { ClientExport } from './ClientExport';
+import { Files } from './Files';
 import type { ServerView, Tab } from './types';
 
 const PLAY = 'hp_hosuto_play';
@@ -134,6 +135,7 @@ function ServerScreen({ serverId, wanted, canPlay, canHost, canAdmin, ...props }
   if (canManage) {
     options.push({ value: 'players', label: t('hosuto.tabPlayers') });
     options.push({ value: 'modding', label: t('hosuto.tabModding') });
+    options.push({ value: 'files', label: t('hosuto.tabFiles') });
   }
   if (canPlay) options.push({ value: 'export', label: t('hosuto.tabExport') });
 
@@ -159,6 +161,7 @@ function ServerScreen({ serverId, wanted, canPlay, canHost, canAdmin, ...props }
       {tab === 'reach' && <Reachability {...props} srv={srv} canControl={canControl} onChanged={q.refresh} />}
       {tab === 'players' && canManage && <Players {...props} srv={srv} />}
       {tab === 'modding' && canManage && <Modding {...props} srv={srv} onChanged={q.refresh} />}
+      {tab === 'files' && canManage && <Files {...props} srv={srv} />}
       {tab === 'export' && canPlay && <ClientExport {...props} srv={srv} />}
     </Stack>
   );

@@ -307,6 +307,32 @@ cmd_status() {
   printf '%s\n' "$(systemctl is-active "$u" 2>/dev/null || true)"
 }
 
+# ── autostart ─────────────────────────────────────────────────────────────────────────
+# enable/disable whether this server comes up with the OS. Privileged because it writes the
+# multi-user.target.wants symlink under /etc/systemd/system — hence it lives behind the wrapper.
+# It does NOT start or stop the server now (no --now): a member toggling "start with the system"
+# should not have their running world bounced, nor a stopped one spun up.
+cmd_enable() {
+  local owner="$1" slug="$2"
+  require_server "$owner" "$slug" >/dev/null
+  systemctl enable "$(unit "$owner" "$slug")" >/dev/null 2>&1 \
+    || die "could not enable autostart for $(unit "$owner" "$slug")" 4
+}
+
+cmd_disable() {
+  local owner="$1" slug="$2"
+  require_server "$owner" "$slug" >/dev/null
+  systemctl disable "$(unit "$owner" "$slug")" >/dev/null 2>&1 \
+    || die "could not disable autostart for $(unit "$owner" "$slug")" 4
+}
+
+cmd_is-enabled() {
+  local owner="$1" slug="$2"
+  check_owner "$owner"; check_slug "$slug"
+  # Prints "enabled"/"disabled"/"static"…; exits non-zero for anything but enabled, which is fine.
+  printf '%s\n' "$(systemctl is-enabled "$(unit "$owner" "$slug")" 2>/dev/null || true)"
+}
+
 # ── destroy ───────────────────────────────────────────────────────────────────────────
 # Stops the unit, drops the drop-in, and removes ONLY the realpath-verified server directory.
 # Nothing else on the host is ever touched.
@@ -350,12 +376,15 @@ cmd_destroy() {
 # ── dispatch ──────────────────────────────────────────────────────────────────────────
 usage() {
   cat >&2 <<'EOF'
-usage: hosuto-server create  <owner> <slug> <heapMB> <port> <rconPort>
-       hosuto-server start   <owner> <slug>
-       hosuto-server stop    <owner> <slug>
-       hosuto-server restart <owner> <slug>
-       hosuto-server destroy <owner> <slug>
-       hosuto-server status  <owner> <slug>
+usage: hosuto-server create     <owner> <slug> <heapMB> <port> <rconPort>
+       hosuto-server start      <owner> <slug>
+       hosuto-server stop       <owner> <slug>
+       hosuto-server restart    <owner> <slug>
+       hosuto-server destroy    <owner> <slug>
+       hosuto-server status     <owner> <slug>
+       hosuto-server enable     <owner> <slug>   (autostart on)
+       hosuto-server disable    <owner> <slug>   (autostart off)
+       hosuto-server is-enabled <owner> <slug>
 EOF
   exit 2
 }
@@ -371,6 +400,14 @@ case "$verb" in
   start|stop|restart|destroy|status)
     [ $# -eq 3 ] || usage
     "cmd_$verb" "$owner" "$slug"
+    ;;
+  enable|disable)
+    [ $# -eq 3 ] || usage
+    "cmd_$verb" "$owner" "$slug"
+    ;;
+  is-enabled)
+    [ $# -eq 3 ] || usage
+    cmd_is-enabled "$owner" "$slug"
     ;;
   *) usage ;;
 esac

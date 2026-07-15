@@ -57,6 +57,7 @@ type Status struct {
 	Online    int      `json:"online"`
 	Max       int      `json:"max"`
 	Sample    []string `json:"sample,omitempty"`
+	Autostart bool     `json:"autostart"` // comes up with the OS
 }
 
 // Manager drives server lifecycles.
@@ -303,6 +304,24 @@ func (m *Manager) State(ctx context.Context, srv store.Server) string {
 	return s
 }
 
+// Autostart reports whether the server is set to come up with the OS. `systemctl is-enabled` is
+// read-only, so the daemon runs it directly — no escalation needed for a query.
+func (m *Manager) Autostart(ctx context.Context, srv store.Server) bool {
+	out, _ := exec.CommandContext(ctx, "systemctl", "is-enabled", Unit(srv.Owner, srv.Slug)).Output()
+	return strings.TrimSpace(string(out)) == "enabled"
+}
+
+// SetAutostart turns "start with the system" on or off. Enabling writes a systemd .wants symlink
+// under /etc, so it goes through the privileged wrapper. It deliberately does not start or stop the
+// server now: toggling the boot behaviour must not bounce a running world.
+func (m *Manager) SetAutostart(ctx context.Context, srv store.Server, on bool) error {
+	verb := "disable"
+	if on {
+		verb = "enable"
+	}
+	return run(ctx, verb, srv.Owner, srv.Slug)
+}
+
 // Status combines systemd's view with a real Server List Ping.
 //
 // The ping goes to the LOCAL backend port but sends the PUBLIC hostname in the handshake, which is
@@ -310,7 +329,7 @@ func (m *Manager) State(ctx context.Context, srv store.Server) string {
 // still be unreachable (still loading the world, or bound wrong), so the two are reported separately
 // rather than collapsed into one lie.
 func (m *Manager) Status(ctx context.Context, srv store.Server) Status {
-	st := Status{State: m.State(ctx, srv)}
+	st := Status{State: m.State(ctx, srv), Autostart: m.Autostart(ctx, srv)}
 	if st.State != "active" {
 		return st
 	}

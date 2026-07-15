@@ -79,6 +79,7 @@ export interface Status {
   online: number;
   max: number;
   sample?: string[];
+  autostart: boolean; // comes up with the OS
 }
 
 // A server as the API hands it over, with the caller's relationship to it attached.
@@ -158,4 +159,4 @@ export interface CatalogModsResp {
   mods: ModHit[];
 }
 
-export type Tab = 'reach' | 'players' | 'modding' | 'export';
+export type Tab = 'reach' | 'players' | 'modding' | 'files' | 'export';

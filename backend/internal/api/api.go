@@ -29,6 +29,7 @@ import (
 	"hosuto/internal/contax"
 	"hosuto/internal/directory"
 	"hosuto/internal/export"
+	"hosuto/internal/files"
 	"hosuto/internal/hconfig"
 	"hosuto/internal/mcapi"
 	"hosuto/internal/mcfiles"
@@ -101,6 +102,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+base+"servers/{id}/stop", s.guard(rights.GroupPlay, true, s.lifecycle("stop")))
 	mux.HandleFunc("POST "+base+"servers/{id}/restart", s.guard(rights.GroupPlay, true, s.lifecycle("restart")))
 	mux.HandleFunc("GET "+base+"servers/{id}/status", s.guard(rights.GroupPlay, false, s.status))
+	mux.HandleFunc("PUT "+base+"servers/{id}/autostart", s.guard(rights.GroupHost, true, s.setAutostart))
+
+	// Spieledateien: the server's own on-disk tree, browsed through the holistic Files UI. Owner-only
+	// throughout — the tree holds configs, worlds and the rcon password, not a merely-a-member surface.
+	// The coarse right gates the route; treeFor() enforces ownership inside every handler.
+	mux.HandleFunc("GET "+base+"servers/{id}/fs/roots", s.guard(rights.GroupPlay, false, s.fsRoots))
+	mux.HandleFunc("GET "+base+"servers/{id}/fs/list", s.guard(rights.GroupPlay, false, s.fsList))
+	mux.HandleFunc("GET "+base+"servers/{id}/fs/download", s.guard(rights.GroupPlay, false, s.fsServe(true)))
+	mux.HandleFunc("GET "+base+"servers/{id}/fs/raw", s.guard(rights.GroupPlay, false, s.fsServe(false)))
+	mux.HandleFunc("GET "+base+"servers/{id}/fs/text", s.guard(rights.GroupPlay, false, s.fsText))
+	mux.HandleFunc("POST "+base+"servers/{id}/fs/mkdir", s.guard(rights.GroupHost, true, s.fsMkdir))
+	mux.HandleFunc("POST "+base+"servers/{id}/fs/rename", s.guard(rights.GroupHost, true, s.fsRename))
+	mux.HandleFunc("POST "+base+"servers/{id}/fs/move", s.guard(rights.GroupHost, true, s.fsMove))
+	mux.HandleFunc("POST "+base+"servers/{id}/fs/copy", s.guard(rights.GroupHost, true, s.fsCopy))
+	mux.HandleFunc("POST "+base+"servers/{id}/fs/delete", s.guard(rights.GroupHost, true, s.fsDelete))
+	mux.HandleFunc("POST "+base+"servers/{id}/fs/upload", s.guard(rights.GroupHost, true, s.fsUpload))
 
 	mux.HandleFunc("GET "+base+"servers/{id}/members", s.guard(rights.GroupPlay, false, s.listMembers))
 	mux.HandleFunc("POST "+base+"servers/{id}/members", s.guard(rights.GroupHost, true, s.addMembers))
@@ -505,6 +522,243 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, u *auth.User) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.rt.Status(r.Context(), srv))
+}
+
+// setAutostart toggles whether the server comes up with the OS. It never starts or stops the server
+// now — that is the point of a separate control from the start/stop buttons.
+func (s *Server) setAutostart(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	srv, ok := s.owned(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "Malformed request")
+		return
+	}
+	if err := s.rt.SetAutostart(r.Context(), srv, body.Enabled); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"autostart": body.Enabled})
+}
+
+// ── Spieledateien: the server's on-disk tree ──────────────────────────────────────────
+//
+// The files package is confined to the one server directory (symlink escapes and traversal are
+// refused there); this layer only adds the ownership gate and maps its errors to HTTP. Every handler
+// requires the caller to OWN the server (or be admin) — the file tree holds configs, worlds and rcon
+// passwords, so it is not a merely-a-member surface.
+
+// treeFor resolves the owned server and opens its confined tree.
+func (s *Server) treeFor(r *http.Request, u *auth.User) (store.Server, *files.Tree, bool) {
+	srv, ok := s.owned(r, u)
+	if !ok {
+		return store.Server{}, nil, false
+	}
+	tr, err := files.Open(runtime.Dir(srv.Owner, srv.Slug))
+	if err != nil {
+		return srv, nil, false
+	}
+	return srv, tr, true
+}
+
+// fsError maps a files-package error to an HTTP status + message.
+func fsError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, files.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "No such file")
+	case errors.Is(err, files.ErrDenied):
+		writeErr(w, http.StatusForbidden, "Not allowed")
+	case errors.Is(err, files.ErrExists):
+		writeErr(w, http.StatusConflict, "A file with that name already exists")
+	case errors.Is(err, files.ErrInvalid):
+		writeErr(w, http.StatusBadRequest, "Invalid request")
+	default:
+		writeErr(w, http.StatusInternalServerError, "File operation failed")
+	}
+}
+
+func (s *Server) fsRoots(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	_, tr, ok := s.treeFor(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	writeJSON(w, http.StatusOK, tr.Roots())
+}
+
+func (s *Server) fsList(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	_, tr, ok := s.treeFor(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	path := r.URL.Query().Get("path")
+	entries, err := tr.List(path)
+	if err != nil {
+		fsError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"path": path, "entries": entries})
+}
+
+// fsServe streams a file, either as a download (attachment) or inline (for image/media/pdf preview
+// and thumbnails).
+func (s *Server) fsServe(download bool) handler {
+	return func(w http.ResponseWriter, r *http.Request, u *auth.User) {
+		_, tr, ok := s.treeFor(r, u)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "No such server")
+			return
+		}
+		f, e, err := tr.OpenFile(r.URL.Query().Get("path"))
+		if err != nil {
+			fsError(w, err)
+			return
+		}
+		defer f.Close()
+		if e.Mime != "" {
+			w.Header().Set("Content-Type", e.Mime)
+		}
+		if download {
+			w.Header().Set("Content-Disposition", `attachment; filename="`+files.DownloadName(e)+`"`)
+		}
+		w.Header().Set("Cache-Control", "private, no-store")
+		http.ServeContent(w, r, e.Name, time.UnixMilli(e.MTime), f)
+	}
+}
+
+func (s *Server) fsText(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	_, tr, ok := s.treeFor(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	// 256 KiB is plenty for a config or the tail a person reads; a 200 MB latest.log is not something
+	// to shovel into the browser. Truncation is reported so the viewer can say so.
+	content, truncated, err := tr.ReadText(r.URL.Query().Get("path"), 256<<10)
+	if err != nil {
+		fsError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"content": content, "truncated": truncated})
+}
+
+func (s *Server) fsMkdir(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	_, tr, ok := s.treeFor(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	var body struct{ Path, Name string }
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "Malformed request")
+		return
+	}
+	if err := tr.Mkdir(body.Path, body.Name); err != nil {
+		fsError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) fsRename(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	_, tr, ok := s.treeFor(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	var body struct{ Path, NewName string }
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "Malformed request")
+		return
+	}
+	if err := tr.Rename(body.Path, body.NewName); err != nil {
+		fsError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) fsMove(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	s.fsRelocate(w, r, u, false)
+}
+func (s *Server) fsCopy(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	s.fsRelocate(w, r, u, true)
+}
+
+func (s *Server) fsRelocate(w http.ResponseWriter, r *http.Request, u *auth.User, cp bool) {
+	_, tr, ok := s.treeFor(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	var body struct{ Src, DstDir string }
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "Malformed request")
+		return
+	}
+	var err error
+	if cp {
+		err = tr.Copy(body.Src, body.DstDir)
+	} else {
+		err = tr.Move(body.Src, body.DstDir)
+	}
+	if err != nil {
+		fsError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) fsDelete(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	_, tr, ok := s.treeFor(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	var body struct {
+		Path      string `json:"path"`
+		Recursive bool   `json:"recursive"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "Malformed request")
+		return
+	}
+	if err := tr.Delete(body.Path, body.Recursive); err != nil {
+		fsError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) fsUpload(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	_, tr, ok := s.treeFor(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	// The upload is streamed to a temp file, so it is never buffered in memory; 32 KiB is only the
+	// multipart part-header budget, not the file size.
+	if err := r.ParseMultipartForm(32 << 10); err != nil {
+		writeErr(w, http.StatusBadRequest, "Malformed upload")
+		return
+	}
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "No file")
+		return
+	}
+	defer f.Close()
+	if err := tr.Save(r.FormValue("path"), hdr.Filename, f); err != nil {
+		fsError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // ── members: the contax mapping ───────────────────────────────────────────────────────
