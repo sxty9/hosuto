@@ -460,6 +460,22 @@ func tailFile(path string, lines int) (string, error) {
 	return strings.Join(all, "\n"), nil
 }
 
+// Ping measures how quickly the server answers a Server List Ping and reports the round-trip latency.
+// hosuto runs on the same host, so this is the loopback round-trip — a measure of the server's own
+// responsiveness (it climbs when the network thread is saturated), not a remote player's client ping,
+// which the vanilla protocol does not expose to the server. ok is false when the server is not up or
+// does not answer within the timeout.
+func (m *Manager) Ping(ctx context.Context, srv store.Server) (time.Duration, bool) {
+	if m.State(ctx, srv) != "active" {
+		return 0, false
+	}
+	start := time.Now()
+	if _, err := mcnet.Ping(ctx, "127.0.0.1:"+strconv.Itoa(srv.Port), srv.Host, srv.Port, 3*time.Second); err != nil {
+		return 0, false
+	}
+	return time.Since(start), true
+}
+
 // Say sends a chat line to a running server (used to tell players a change landed).
 func (m *Manager) Say(ctx context.Context, srv store.Server, msg string) {
 	if m.State(ctx, srv) != "active" {

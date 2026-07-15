@@ -157,7 +157,7 @@ func main() {
 	go eng.Run(igCtx)
 
 	srv := &http.Server{
-		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk, tok, chats, hub, acc).Handler(),
+		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk, tok, chats, hub, acc, ai).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	// Bind synchronously so "address already in use" surfaces here, not inside a goroutine.

@@ -2,7 +2,7 @@
 // Minecraft, and is anyone there. "Reachable" is not the same as "running": the unit can be up
 // while the game is still loading the world, so the status comes from a real Server List Ping,
 // not from systemd's opinion.
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Badge,
   Box,
@@ -19,7 +19,7 @@ import {
   useT,
   type ServiceContextProps,
 } from '@holistic/ui';
-import type { RunState, ServerView, Status } from './types';
+import type { Diagnose, RunState, ServerView, Status } from './types';
 
 const DOT: Record<RunState, string> = {
   active: 'bg-success',
@@ -50,6 +50,28 @@ export function Reachability({
   const state: RunState = st?.state ?? srv.status?.state ?? 'inactive';
   const running = state === 'active' || state === 'activating';
   const autostart = st?.autostart ?? srv.status?.autostart ?? false;
+
+  // When a start fails, fetch the console log + a short AI explanation ONCE (the effect re-runs only
+  // when the state transitions, so a 5s status poll that stays "failed" does not re-ask the AI).
+  const [diag, setDiag] = useState<Diagnose | null>(null);
+  const [diagLoading, setDiagLoading] = useState(false);
+  useEffect(() => {
+    if (state !== 'failed' || !canControl) {
+      setDiag(null);
+      return;
+    }
+    let live = true;
+    setDiagLoading(true);
+    setDiag(null);
+    api
+      .get<Diagnose>(`servers/${srv.id}/diagnose`)
+      .then((d) => live && setDiag(d))
+      .catch(() => live && setDiag(null))
+      .finally(() => live && setDiagLoading(false));
+    return () => {
+      live = false;
+    };
+  }, [state, srv.id, canControl, api]);
 
   async function toggleAutostart(next: boolean) {
     setAutostartBusy(true);
@@ -137,6 +159,45 @@ export function Reachability({
           )}
         </Stack>
       </Panel>
+
+      {canControl && state === 'failed' && (
+        <Panel title={t('hosuto.startFailed')} className="p-4">
+          <Stack gap={3}>
+            {diagLoading && (
+              <Stack direction="row" align="center" gap={2}>
+                <Spinner className="h-4 w-4" />
+                <Text variant="footnote" color="secondary">
+                  {t('hosuto.diagnosing')}
+                </Text>
+              </Stack>
+            )}
+            {diag?.diagnosis && (
+              <Box className="rounded-md border border-danger/30 bg-danger/5 p-3">
+                <Text variant="footnote" color="secondary" weight="medium">
+                  {t('hosuto.aiDiagnosis')}
+                  {diag.model ? ` · ${diag.model}` : ''}
+                </Text>
+                <Text className="mt-1 whitespace-pre-wrap">{diag.diagnosis}</Text>
+              </Box>
+            )}
+            {!diagLoading && !diag?.diagnosis && diag?.diagnosisError === 'no-credential' && (
+              <Text variant="footnote" color="secondary">
+                {t('hosuto.diagnoseNoCredential')}
+              </Text>
+            )}
+            {diag?.log && (
+              <Box>
+                <Text variant="footnote" color="secondary" weight="medium">
+                  {t('hosuto.consoleLog')}
+                </Text>
+                <Box className="mt-1 max-h-72 overflow-auto rounded-md border border-line/20 bg-fill/5 p-3">
+                  <Text className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed">{diag.log}</Text>
+                </Box>
+              </Box>
+            )}
+          </Stack>
+        </Panel>
+      )}
 
       {srv.owned && (
         <Panel title={t('hosuto.autostart')} className="p-4">

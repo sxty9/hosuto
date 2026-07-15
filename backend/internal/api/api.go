@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"hosuto/internal/access"
+	"hosuto/internal/aigentic"
 	"hosuto/internal/auth"
 	"hosuto/internal/chathub"
 	"hosuto/internal/chatstore"
@@ -69,6 +70,7 @@ type Server struct {
 	chats *chatstore.Store
 	hub   *chathub.Hub
 	acc   *access.Resolver
+	ai    *aigentic.Client
 	http  *http.Client
 }
 
@@ -76,9 +78,9 @@ type Server struct {
 func New(v *auth.Verifier, st *store.Store, cfg *hconfig.Config, rt *runtime.Manager,
 	dir *directory.Directory, cx *contax.Client, nt *notify.Client, mc *mcapi.Client,
 	mr *modrinth.Client, vc *versions.Client, sk *skin.Renderer, tok *mcp.TokenStore,
-	chats *chatstore.Store, hub *chathub.Hub, acc *access.Resolver) *Server {
+	chats *chatstore.Store, hub *chathub.Hub, acc *access.Resolver, ai *aigentic.Client) *Server {
 	return &Server{v: v, st: st, cfg: cfg, rt: rt, dir: dir, cx: cx, nt: nt, mc: mc, mr: mr, vc: vc,
-		skin: sk, tok: tok, chats: chats, hub: hub, acc: acc, http: &http.Client{Timeout: 60 * time.Second}}
+		skin: sk, tok: tok, chats: chats, hub: hub, acc: acc, ai: ai, http: &http.Client{Timeout: 60 * time.Second}}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -111,6 +113,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+base+"servers/{id}/stop", s.guard(rights.GroupPlay, true, s.lifecycle("stop")))
 	mux.HandleFunc("POST "+base+"servers/{id}/restart", s.guard(rights.GroupPlay, true, s.lifecycle("restart")))
 	mux.HandleFunc("GET "+base+"servers/{id}/status", s.guard(rights.GroupPlay, false, s.status))
+	mux.HandleFunc("GET "+base+"servers/{id}/diagnose", s.guard(rights.GroupPlay, false, s.diagnose))
 	mux.HandleFunc("PUT "+base+"servers/{id}/autostart", s.guard(rights.GroupHost, true, s.setAutostart))
 
 	// Spieledateien: the server's own on-disk tree, browsed through the holistic Files UI. Owner-only
@@ -553,6 +556,44 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, u *auth.User) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.rt.Status(r.Context(), srv))
+}
+
+// diagnose answers "the start failed and I don't know why": it returns the tail of the server's
+// console log plus a short, plain explanation from the AI. The AI runs on the CALLER's own aigentic
+// credential (server-to-server) and degrades silently — the log is always returned, the diagnosis is
+// best-effort, so an operator without an AI credential still gets the log. Gated like start/restart
+// (owner, admin, or an op-level member): if you can start the server you may see why it would not.
+func (s *Server) diagnose(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	srv, ok := s.controlled(r, u)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such server")
+		return
+	}
+	state := s.rt.State(r.Context(), srv)
+	logTail, _ := s.rt.LogTail(srv, 160)
+	resp := map[string]any{"state": state, "log": logTail}
+	if strings.TrimSpace(logTail) != "" && s.ai != nil && s.ai.Enabled() {
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		res, err := s.ai.Run(ctx, u.Username, aigentic.Req{
+			Kind: "choose",
+			System: "You are diagnosing why a Minecraft server failed to start, from its console log. " +
+				"Answer in at most two short, plain sentences: what concretely went wrong and how to fix it. " +
+				"If a mod is missing a required dependency, name the mod and the dependency. No markdown, no preamble.",
+			Prompt: "Console log tail:\n\n" + logTail,
+		})
+		switch {
+		case err == nil:
+			resp["diagnosis"] = strings.TrimSpace(res.Output)
+			resp["engine"] = res.Engine
+			resp["model"] = res.Model
+		case errors.Is(err, aigentic.ErrNoCredential):
+			resp["diagnosisError"] = "no-credential"
+		default:
+			resp["diagnosisError"] = "failed"
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // setAutostart toggles whether the server comes up with the OS. It never starts or stops the server
@@ -1060,12 +1101,12 @@ func (s *Server) addMod(w http.ResponseWriter, r *http.Request, u *auth.User) {
 		writeErr(w, http.StatusBadRequest, "Malformed request")
 		return
 	}
-	m, err := s.installMod(r.Context(), srv, body.ProjectID)
+	m, deps, err := s.installMod(r.Context(), srv, body.ProjectID)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, m)
+	writeJSON(w, http.StatusOK, map[string]any{"mod": m, "dependencies": deps})
 }
 
 // orUnknown records a missing environment field honestly rather than guessing. A guess here would

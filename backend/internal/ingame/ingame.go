@@ -89,6 +89,14 @@ func (e *Engine) trigger() string {
 	return t
 }
 
+func (e *Engine) pingTrigger() string {
+	t := strings.TrimSpace(e.Cfg.String("ingamePingTrigger", "!ping"))
+	if t == "" {
+		return "!ping"
+	}
+	return t
+}
+
 func (e *Engine) interval() time.Duration {
 	s := e.Cfg.Int("ingameInterval", 10)
 	if s < 2 {

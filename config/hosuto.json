@@ -95,6 +95,12 @@
           "default": "!ai"
         },
         {
+          "id": "ingamePingTrigger",
+          "label": "Ping chat trigger",
+          "type": "string",
+          "default": "!ping"
+        },
+        {
           "id": "ingameReplyPrivate",
           "label": "Answer only the asking player",
           "type": "bool",

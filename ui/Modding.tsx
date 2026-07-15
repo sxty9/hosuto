@@ -31,6 +31,7 @@ import {
   type CatalogModsResp,
   type CatalogVersionsResp,
   type Loader,
+  type Mod,
   type ModHit,
   type ModsResp,
   type ServerView,
@@ -179,8 +180,13 @@ function ModSearch({
   async function add(hit: ModHit) {
     setBusy(hit.projectId);
     try {
-      await api.post(`servers/${srv.id}/mods`, { projectId: hit.projectId });
-      ui.toast({ title: t('hosuto.modAdded', { name: hit.title }), variant: 'success' });
+      const res = await api.post<{ mod: Mod; dependencies?: Mod[] }>(`servers/${srv.id}/mods`, { projectId: hit.projectId });
+      const deps = res?.dependencies ?? [];
+      ui.toast({
+        title: t('hosuto.modAdded', { name: hit.title }),
+        description: deps.length ? t('hosuto.modDepsAdded', { deps: deps.map((d) => d.name).join(', ') }) : undefined,
+        variant: 'success',
+      });
       onAdded();
     } catch (e) {
       ui.toast({ title: t('hosuto.modFailed'), description: (e as Error).message, variant: 'error' });

@@ -3,6 +3,7 @@ package ingame
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -11,6 +12,24 @@ import (
 	"hosuto/internal/chatstore"
 	"hosuto/internal/store"
 )
+
+// handlePing answers the !ping liveness check with the server's current round-trip latency. No AI and
+// no operator gate: it exists so anyone can confirm in one line that the server — and hosuto's bridge
+// to it — is alive and how responsive it is. Sub-10ms readings keep a decimal so a fast loopback ping
+// does not collapse to a meaningless "0ms".
+func (e *Engine) handlePing(ctx context.Context, srv store.Server, player string) {
+	lat, ok := e.Mgr.Ping(ctx, srv)
+	if !ok {
+		e.reply(ctx, srv, player, msgInfo, "pong · server not answering")
+		return
+	}
+	ms := lat.Seconds() * 1000
+	if ms < 10 {
+		e.reply(ctx, srv, player, msgInfo, fmt.Sprintf("pong · %.1fms", ms))
+	} else {
+		e.reply(ctx, srv, player, msgInfo, fmt.Sprintf("pong · %.0fms", ms))
+	}
+}
 
 // handleCommand runs the `!ai` grammar for one triggered line. It resolves the typing player to a
 // holistic identity, enforces the operator gate (the SAME rule as the dashboard chat), then dispatches

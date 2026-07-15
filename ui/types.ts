@@ -96,6 +96,17 @@ export interface ServersResp {
   canHost: boolean;
 }
 
+// Why a server did or did not come up: the tail of its console log plus a short AI explanation.
+// The log is always present; diagnosis is best-effort (empty when no AI credential is configured).
+export interface Diagnose {
+  state: RunState;
+  log: string;
+  diagnosis?: string;
+  engine?: string;
+  model?: string;
+  diagnosisError?: 'no-credential' | 'failed';
+}
+
 export interface Info {
   service: string;
   version: string;

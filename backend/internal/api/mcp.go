@@ -221,6 +221,24 @@ func (s *Server) mcp() *mcp.Registry {
 	})
 
 	reg.Register(mcp.Tool{
+		Name:        "server_ping",
+		Description: "Ping a running server and report its round-trip latency in milliseconds. This is the server's own responsiveness measured from the host (it climbs when the server is lagging), not a remote player's client ping. Call this when the user asks how fast the server responds or whether it is lagging.",
+		InputSchema: schema(map[string]any{"server": serverProp}),
+		Handler: func(ctx context.Context, cAny any, args json.RawMessage) (any, error) {
+			c := cAny.(*mcpCaller)
+			srv, err := s.mcpTarget(ctx, c, argServer(args), accessVisible)
+			if err != nil {
+				return nil, err
+			}
+			lat, ok := s.rt.Ping(ctx, srv)
+			if !ok {
+				return map[string]any{"reachable": false}, nil
+			}
+			return map[string]any{"reachable": true, "latencyMs": lat.Milliseconds()}, nil
+		},
+	})
+
+	reg.Register(mcp.Tool{
 		Name:        "autostart_set",
 		Description: "Turn on or off whether the server comes up automatically with the operating system. This does NOT start or stop the server now. Owner only.",
 		InputSchema: schema(map[string]any{
@@ -399,11 +417,15 @@ func (s *Server) mcp() *mcp.Registry {
 			if err != nil {
 				return nil, err
 			}
-			m, err := s.installMod(ctx, srv, a.ProjectID)
+			m, deps, err := s.installMod(ctx, srv, a.ProjectID)
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"added": m.Name, "id": m.ID, "filename": m.Filename}, nil
+			depNames := make([]string, 0, len(deps))
+			for _, d := range deps {
+				depNames = append(depNames, d.Name)
+			}
+			return map[string]any{"added": m.Name, "id": m.ID, "filename": m.Filename, "dependencies": depNames}, nil
 		},
 	})
 

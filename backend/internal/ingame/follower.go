@@ -141,6 +141,11 @@ func (e *Engine) onLogLine(ctx context.Context, srv store.Server, names map[stri
 		return
 	}
 	player, text := m[1], strings.TrimSpace(m[2])
+	// !ping: a cheap liveness + latency check, no AI and no operator gate — anyone in the chat may ask.
+	if strings.EqualFold(text, e.pingTrigger()) {
+		e.handlePing(ctx, srv, player)
+		return
+	}
 	trigger := e.trigger()
 	if text != trigger && !strings.HasPrefix(text, trigger+" ") {
 		return
