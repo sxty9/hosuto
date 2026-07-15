@@ -32,11 +32,22 @@ import type { ChatMsg, ChatResp, ServerView } from './types';
 
 // The aigentic result envelope (a prizm Response whose Data is the aigentic Result).
 interface RunResponse {
-  data: { output: string };
+  data: { output: string; engine?: string; model?: string };
 }
 
 const SCROLL_ID = 'hosuto-ai-scroll';
 const scrollEl = () => document.getElementById(SCROLL_ID);
+
+// Friendly labels for aigentic's engine ids (matching aigentic's own picker), so an operator sees
+// which AI answered rather than an internal id. The tab always drives claude-cli — the only engine
+// that can call the server tools — so answers show "Claude CLI" plus the concrete model.
+const ENGINE_LABEL: Record<string, string> = {
+  'claude-cli': 'Claude CLI',
+  'claude-api': 'Claude API',
+  ollama: 'Local',
+  choose: 'Auto',
+};
+const engineLabel = (e?: string) => (e ? (ENGINE_LABEL[e] ?? e) : 'AI');
 
 // clean strips the trailing "Assistant:" the model may echo back from the transcript.
 function clean(s: string): string {
@@ -98,8 +109,9 @@ export function AskAi({ api, apiFor, ui, user, srv }: Pick<ServiceContextProps, 
         data: { prompt: transcript, system: systemPrompt(srv), mcp: [{ name: 'hosuto', token }] },
       });
       const answer = clean(res.data.output);
-      // Persist the exchange to the shared thread, then refresh so it (and anyone else's turns) show.
-      await api.post(`servers/${srv.id}/chat`, { user: text, assistant: answer });
+      // Persist the exchange to the shared thread — including which engine/model answered, so the
+      // shared log is transparent about the AI used — then refresh so it (and anyone else's turns) show.
+      await api.post(`servers/${srv.id}/chat`, { user: text, assistant: answer, engine: res.data.engine, model: res.data.model });
       setPending(null);
       q.refresh();
     } catch (e) {
@@ -142,7 +154,14 @@ export function AskAi({ api, apiFor, ui, user, srv }: Pick<ServiceContextProps, 
                 </Stack>
               ) : (
                 <Stack key={i} gap={1} className="max-w-full">
-                  <Badge variant="accent">AI</Badge>
+                  <Stack direction="row" align="center" gap={2}>
+                    <Badge variant="accent">{engineLabel(m.engine)}</Badge>
+                    {m.model && (
+                      <Text variant="caption" color="tertiary">
+                        {m.model}
+                      </Text>
+                    )}
+                  </Stack>
                   {m.content ? <Markdown text={m.content} /> : <Text color="secondary">{t('hosuto.ai.emptyReply')}</Text>}
                 </Stack>
               ),

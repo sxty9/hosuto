@@ -167,6 +167,8 @@ export interface ChatMsg {
   role: 'user' | 'assistant';
   content: string;
   author?: string;
+  engine?: string; // assistant turn: which aigentic engine answered
+  model?: string; // assistant turn: which concrete model answered
   ts: number;
 }
 export interface ChatResp {

@@ -51,6 +51,8 @@ func (s *Server) postChat(w http.ResponseWriter, r *http.Request, u *auth.User) 
 	var body struct {
 		User      string `json:"user"`
 		Assistant string `json:"assistant"`
+		Engine    string `json:"engine"`
+		Model     string `json:"model"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "Malformed request")
@@ -62,7 +64,7 @@ func (s *Server) postChat(w http.ResponseWriter, r *http.Request, u *auth.User) 
 		msgs = append(msgs, chatstore.Msg{Role: "user", Content: body.User, Author: u.Username, TS: now})
 	}
 	if body.Assistant != "" {
-		msgs = append(msgs, chatstore.Msg{Role: "assistant", Content: body.Assistant, TS: now})
+		msgs = append(msgs, chatstore.Msg{Role: "assistant", Content: body.Assistant, Engine: body.Engine, Model: body.Model, TS: now})
 	}
 	if len(msgs) == 0 {
 		writeErr(w, http.StatusBadRequest, "Nothing to add")

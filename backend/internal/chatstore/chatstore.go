@@ -37,6 +37,8 @@ type Msg struct {
 	Role    string `json:"role"`             // "user" | "assistant"
 	Content string `json:"content"`          // the text
 	Author  string `json:"author,omitempty"` // the operator who sent a user turn (empty for the assistant)
+	Engine  string `json:"engine,omitempty"` // assistant turn: the aigentic engine that answered
+	Model   string `json:"model,omitempty"`  // assistant turn: the concrete model that answered
 	TS      int64  `json:"ts"`               // epoch ms
 }
 
