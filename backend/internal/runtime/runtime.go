@@ -181,30 +181,43 @@ func (m *Manager) Create(ctx context.Context, srv store.Server) (store.Server, e
 }
 
 // writeProps merges hosuto's owned keys over whatever is already in server.properties, so a key the
-// user or the server itself added survives.
+// user or the server itself added survives. mcfiles.Apply is the single writer of those keys (it fails
+// closed on an empty rcon password), so this path can never produce a file that boots with rcon
+// disabled.
 func (m *Manager) writeProps(srv store.Server) error {
 	path := filepath.Join(Dir(srv.Owner, srv.Slug), "server.properties")
 	p, err := mcfiles.ReadProps(path)
 	if err != nil {
 		return err
 	}
-	// server-ip binds BOTH the game port and rcon to loopback — there is no rcon.ip key. This single
-	// line is what keeps every backend unreachable except through mc-router.
-	p["server-ip"] = "127.0.0.1"
-	p["server-port"] = strconv.Itoa(srv.Port)
-	p["enable-rcon"] = "true"
-	p["rcon.port"] = strconv.Itoa(srv.RconPort)
-	p["rcon.password"] = srv.RconPass
-	p["broadcast-rcon-to-ops"] = "false"
-	// query.port defaults to the server port; leaving query enabled would collide with the game port.
-	p["enable-query"] = "false"
-	// Never false: each backend authenticates against Mojang itself. mc-router only splices bytes.
-	p["online-mode"] = "true"
-	p["white-list"] = strconv.FormatBool(srv.JoinPolicy == "whitelist")
-	// enforce-whitelist makes a `whitelist reload` kick players who are no longer on the list.
-	p["enforce-whitelist"] = "true"
-	if _, ok := p["motd"]; !ok {
-		p["motd"] = srv.Name
+	// rcon.password is the one hosuto-owned key NOT persisted in state (json:"-"); server.properties
+	// is its source of truth. Prefer the in-memory value (fresh create), else keep the on-disk one
+	// (after a daemon restart the field is empty), else mint a fresh one. Without this, a rewrite would
+	// blank the password with the empty in-memory field and the server would silently disable rcon —
+	// leaving hosuto (whitelist reload, MCP tools, the in-game "!ai") unable to reach the console.
+	pass := srv.RconPass
+	if pass == "" {
+		pass = strings.TrimSpace(p["rcon.password"])
+	}
+	if pass == "" {
+		if pass, err = mcfiles.GenRconPassword(); err != nil {
+			return err
+		}
+	}
+	// Preserve an admin-customised MOTD; default it to the server name only when unset.
+	motd := srv.Name
+	if existing, ok := p["motd"]; ok {
+		motd = existing
+	}
+	p, err = mcfiles.Apply(p, mcfiles.Settings{
+		Port:      srv.Port,
+		RconPort:  srv.RconPort,
+		RconPass:  pass,
+		MOTD:      motd,
+		Whitelist: srv.JoinPolicy == "whitelist",
+	})
+	if err != nil {
+		return err
 	}
 	return mcfiles.WriteProps(path, p)
 }
@@ -275,14 +288,22 @@ func (m *Manager) SyncDefault(ctx context.Context) error {
 	return m.rt.SetDefault(ctx, "")
 }
 
-// Start/Stop/Restart drive the unit through the wrapper.
+// Start/Stop/Restart drive the unit through the wrapper. Start and Restart re-assert hosuto's owned
+// server.properties keys first, so a server always boots with the canonical config — in particular a
+// valid rcon.password, even after a daemon restart dropped the in-memory copy. Stop needs no rewrite.
 func (m *Manager) Start(ctx context.Context, srv store.Server) error {
+	if err := m.writeProps(srv); err != nil {
+		return err
+	}
 	return run(ctx, "start", srv.Owner, srv.Slug)
 }
 func (m *Manager) Stop(ctx context.Context, srv store.Server) error {
 	return run(ctx, "stop", srv.Owner, srv.Slug)
 }
 func (m *Manager) Restart(ctx context.Context, srv store.Server) error {
+	if err := m.writeProps(srv); err != nil {
+		return err
+	}
 	return run(ctx, "restart", srv.Owner, srv.Slug)
 }
 
@@ -345,7 +366,21 @@ func (m *Manager) Status(ctx context.Context, srv store.Server) Status {
 
 // rcon opens an authenticated RCON connection to a running server.
 func (m *Manager) rcon(srv store.Server) (*mcnet.Conn, error) {
-	return mcnet.Dial("127.0.0.1:"+strconv.Itoa(srv.RconPort), srv.RconPass, 5*time.Second)
+	return mcnet.Dial("127.0.0.1:"+strconv.Itoa(srv.RconPort), m.rconPass(srv), 5*time.Second)
+}
+
+// rconPass resolves the server's rcon password. RconPass is json:"-" (never persisted), so after a
+// daemon restart the in-memory field is empty and server.properties — where writeProps keeps it — is
+// the source of truth. Returns "" only when the file is unreadable or the key is genuinely unset.
+func (m *Manager) rconPass(srv store.Server) string {
+	if srv.RconPass != "" {
+		return srv.RconPass
+	}
+	p, err := mcfiles.ReadProps(filepath.Join(Dir(srv.Owner, srv.Slug), "server.properties"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(p["rcon.password"])
 }
 
 // ApplyWhitelist writes whitelist.json + ops.json and, if the server is running, makes it take
