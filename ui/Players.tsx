@@ -76,7 +76,7 @@ export function Players({
       // not picked the change up yet. Passing that on beats pretending it took effect.
       ui.toast({
         title: t('hosuto.policySaved'),
-        description: r.restartRequired ? t('hosuto.restartRequired') : undefined,
+        description: r.restartRequired ? t('hosuto.restartToApply') : undefined,
         variant: 'success',
       });
       q.refresh();
