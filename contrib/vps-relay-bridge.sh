@@ -112,9 +112,14 @@ ListenPort = $WG_PORT
 PrivateKey = $VPS_PRIV
 PostUp = sysctl -w net.ipv4.ip_forward=1$(printf '%b' "$up")
 PostUp = iptables -t nat -A POSTROUTING -o %i -j MASQUERADE
+# WireGuard verkleinert die MTU auf 1420 — ohne MSS-Klemme zerbrechen grosse TCP-Pakete (z.B.
+# Minecrafts update_recipes) im Tunnel und der Client wirft einen DecoderException. Die Klemme
+# setzt die TCP-MSS beim Verbindungsaufbau auf die Pfad-MTU, in beide Richtungen.
+PostUp = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostUp = iptables -A FORWARD -i %i -j ACCEPT
 PostUp = iptables -A FORWARD -o %i -j ACCEPT
 PostDown = iptables -t nat -D POSTROUTING -o %i -j MASQUERADE || true
+PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
 PostDown = iptables -D FORWARD -i %i -j ACCEPT || true
 PostDown = iptables -D FORWARD -o %i -j ACCEPT || true$(printf '%b' "$down")
 
