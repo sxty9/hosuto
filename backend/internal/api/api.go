@@ -263,7 +263,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request, u *auth.User) {
 		"service": service,
 		"version": version,
 		"user":    u.Username,
-		"zone":    s.cfg.String("zone", "mc.henrysoase.org"),
+		"zone":    s.cfg.String("zone", ""),
 		"canHost": u.Can(rights.GroupHost),
 	})
 }

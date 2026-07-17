@@ -88,9 +88,20 @@ func Instance(owner, slug string) string { return owner + "-" + slug }
 // Unit is the full systemd unit name.
 func Unit(owner, slug string) string { return "hosuto-mc@" + Instance(owner, slug) + ".service" }
 
-// Host is a server's public domain.
+// Host is a server's public domain: <slug>.<zone>. An admin may pin an explicit publicHost — a tunnel
+// like playit presents every server under ITS OWN hostname, not slug.zone, so that override wins. With
+// neither publicHost nor zone set (a fresh, not-yet-configured instance) the bare slug is returned:
+// the server is LAN-only until the operator sets a zone or a public address. The instance's domain is
+// never hardcoded here — that would be an instance-specific value in a shared repo.
 func (m *Manager) Host(slug string) string {
-	return slug + "." + m.cfg.String("zone", "mc.henrysoase.org")
+	if ph := strings.TrimSpace(m.cfg.String("publicHost", "")); ph != "" {
+		return ph
+	}
+	zone := strings.TrimSpace(m.cfg.String("zone", ""))
+	if zone == "" {
+		return slug
+	}
+	return slug + "." + zone
 }
 
 // run invokes the privileged wrapper, surfacing its stderr (the wrapper is the one that knows why
@@ -267,21 +278,24 @@ func (m *Manager) SyncRoutes(ctx context.Context) error {
 	return m.SyncDefault(ctx)
 }
 
-// SyncDefault points mc-router's fallback at the server named by the `defaultServer` config setting
-// (a slug), or clears it when the setting is empty.
+// SyncDefault keeps mc-router's fallback route in step with the chosen exposure method.
 //
-// Why it exists: a host with no port forward is reached through a tunnel (playit.gg and the like),
-// and such a tunnel presents the connection under ITS OWN hostname. Our domain never appears in the
-// handshake, so mc-router has nothing to match and refuses everything. A fallback is then the only
-// way anyone connects at all.
+// Only the `playit` method needs a fallback: a tunnel presents every connection under ITS OWN
+// hostname, so our domain never appears in the handshake and mc-router has nothing to match — a
+// fallback is then the only way anyone connects. Both `direct-port` and `vps-relay` are transparent
+// (a port-forward, or a WireGuard relay that splices raw TCP to mc-router), so the player's real
+// hostname reaches the handshake and hostname routing works; a fallback there would only misdirect
+// every stray or guessed connection, so it is cleared.
 //
-// It is deliberately an explicit admin choice and not a default: on a host where several members
-// have servers, a fallback hands every stray or guessed connection to whoever is named in it. It is
-// safe exactly where it is needed — a host with one server — and unsafe everywhere else, which is
-// why hosuto will not infer it.
+// For playit it points at the ONE server named by `defaultServer` (a slug). That is an explicit admin
+// choice, never inferred: on a host with several servers a fallback hands every stray connection to
+// whoever is named in it — safe only where it is needed (a single-server tunnel host).
 func (m *Manager) SyncDefault(ctx context.Context) error {
 	if !m.rt.Enabled() {
 		return nil
+	}
+	if m.cfg.String("exposureMethod", "direct-port") != "playit" {
+		return m.rt.SetDefault(ctx, "") // hostname routing: no fallback, mc-router matches the real domain
 	}
 	slug := strings.TrimSpace(m.cfg.String("defaultServer", ""))
 	if slug == "" {

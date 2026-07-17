@@ -5,11 +5,11 @@ allows, invites the people they already know through [contax], and hands them a 
 bundle. Minecraft Java Edition in this first pass; the store is shaped for more games.
 
 ```
-Player ── smp.mc.<zone>:25565 ──► router (FRITZ!Box forwards 25565/tcp)
+Player ── smp.<zone>:25565 ──► the public front door (see "Exposure methods" below)
                                     │
                                mc-router — reads the hostname out of the Minecraft handshake
-                                    ├─ smp.mc.<zone>      → 127.0.0.1:25601   hosuto-mc@ann-smp
-                                    └─ skyblock.mc.<zone> → 127.0.0.1:25602   hosuto-mc@bob-skyblock
+                                    ├─ smp.<zone>      → 127.0.0.1:25601   hosuto-mc@ann-smp
+                                    └─ skyblock.<zone> → 127.0.0.1:25602   hosuto-mc@bob-skyblock
 Browser ───── /api/services/hosuto/* ─────► Caddy ──► hosutod (127.0.0.1:8779)
 Desktop app ─ the same routes, Bearer ───►   ▲             │ sudo -n /usr/local/sbin/hosuto-server
                                                            │ RCON on 127.0.0.1 (whitelist, list, stop)
@@ -131,10 +131,29 @@ python3 ../holistic/services/dashboard/lib/holistic-perms.py  validate ./permiss
 python3 ../holistic/services/dashboard/lib/holistic-config.py validate ./config
 ```
 
+## Exposure methods — how the public reaches mc-router
+
+hosuto only keeps mc-router's route table honest; the actual LAN→internet crossing is a deliberate,
+admin-chosen concern, set as `exposureMethod` in the central Configuration tab. Every method fans out
+through the same local mc-router (`127.0.0.1:25565`), so the daemon code is method-agnostic — only the
+*fallback route* and the *advertised address* differ.
+
+- **`direct-port`** (default) — forward TCP 25565 on the router, point `*.<zone>` A-records (with DDNS
+  for a dynamic IP) at the public IPv4. Lowest latency; the home IP is exposed. Hostname routing, any
+  number of servers.
+- **`vps-relay`** — the home makes an *outbound* WireGuard tunnel to a small rented VPS that is the
+  public front and forwards the game ports home. Nothing is opened on the router, the home IP stays
+  hidden, a DDoS hits the VPS. One extra hop (~10-15 ms). Set up with `contrib/vps-relay-bridge.sh`;
+  point `<zone>` at the VPS.
+- **`playit`** — an outbound tunnel via playit.gg for hosts that cannot forward a port. Third-party
+  traffic path, and it terminates under its own hostname, so it needs a single-server fallback
+  (`defaultServer`) and cannot hostname-route several servers. Set up with `contrib/playit-bridge.sh`.
+
+`zone` and `publicHost` have no built-in default — an instance sets its own domain. Until a `zone`
+(or a public address) and a method are configured, servers are reachable on the LAN only.
+
 ## Not done yet
 
-- **Port 25565 must be forwarded on the router**, and the public IPv4 is dynamic — the per-server
-  A records need DDNS. Until both are true, servers are reachable on the LAN only.
 - Account linking is a *claim* (name → Mojang UUID), not a proof. `Account.Verified` exists for a
   later Microsoft OAuth flow.
 - No world backups.

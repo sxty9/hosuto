@@ -8,10 +8,23 @@
       "description": "How players reach the game servers.",
       "settings": [
         {
+          "id": "exposureMethod",
+          "label": "How players reach servers from the internet",
+          "type": "enum",
+          "options": ["direct-port", "vps-relay", "playit"],
+          "default": "direct-port"
+        },
+        {
           "id": "zone",
           "label": "Game DNS zone",
           "type": "string",
-          "default": "mc.henrysoase.org"
+          "default": ""
+        },
+        {
+          "id": "publicHost",
+          "label": "Public address override (playit only)",
+          "type": "string",
+          "default": ""
         },
         {
           "id": "routerApi",
@@ -21,7 +34,7 @@
         },
         {
           "id": "defaultServer",
-          "label": "Fallback server (address)",
+          "label": "Fallback server — playit only (slug)",
           "type": "string",
           "default": ""
         },
