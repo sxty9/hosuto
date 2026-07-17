@@ -505,19 +505,44 @@ func tailFile(path string, lines int) (string, error) {
 	return strings.Join(all, "\n"), nil
 }
 
-// Ping measures how quickly the server answers a Server List Ping and reports the round-trip latency.
-// hosuto runs on the same host, so this is the loopback round-trip — a measure of the server's own
-// responsiveness (it climbs when the network thread is saturated), not a remote player's client ping,
-// which the vanilla protocol does not expose to the server. ok is false when the server is not up or
-// does not answer within the timeout.
+// Ping measures the round-trip latency to the server the way a PLAYER reaches it: a TCP connect over
+// the configured exposure path to the public address (slug.zone:25565) — through the VPS relay,
+// port-forward or tunnel. That is the number a player feels, not the ~0ms loopback that the game and
+// hosuto share. It falls back to the loopback backend when the public path is not reachable from here
+// (a LAN-only server, or a router without hairpin NAT), so the check still returns something. A bare
+// TCP handshake is one clean round-trip, so it reads the network RTT directly.
+//
+// Caveat it cannot escape: this is measured from the SERVER's own location, so it is the server's
+// public round-trip, not any one remote player's exact ping (vanilla exposes no per-player latency to
+// the server). For players near the server it matches closely; for distant ones it under-reports.
 func (m *Manager) Ping(ctx context.Context, srv store.Server) (time.Duration, bool) {
 	if m.State(ctx, srv) != "active" {
 		return 0, false
 	}
-	start := time.Now()
-	if _, err := mcnet.Ping(ctx, "127.0.0.1:"+strconv.Itoa(srv.Port), srv.Host, srv.Port, 3*time.Second); err != nil {
+	if host := strings.TrimSpace(srv.Host); host != "" {
+		if d, ok := tcpRTT(ctx, host, 25565); ok {
+			return d, true
+		}
+	}
+	return tcpRTT(ctx, "127.0.0.1", srv.Port)
+}
+
+// tcpRTT times a single TCP handshake to host:port (one network round-trip). DNS is resolved FIRST,
+// outside the timer, so a cold lookup does not inflate the measured latency. ok is false on any error.
+func tcpRTT(ctx context.Context, host string, port int) (time.Duration, bool) {
+	c, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(c, host)
+	if err != nil || len(ips) == 0 {
 		return 0, false
 	}
+	addr := net.JoinHostPort(ips[0].IP.String(), strconv.Itoa(port))
+	start := time.Now()
+	conn, err := (&net.Dialer{}).DialContext(c, "tcp", addr)
+	if err != nil {
+		return 0, false
+	}
+	_ = conn.Close()
 	return time.Since(start), true
 }
 
