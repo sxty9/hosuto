@@ -10,10 +10,10 @@ Player ── smp.mc.<zone>:25565 ──► router (FRITZ!Box forwards 25565/tcp
                                mc-router — reads the hostname out of the Minecraft handshake
                                     ├─ smp.mc.<zone>      → 127.0.0.1:25601   hosuto-mc@ann-smp
                                     └─ skyblock.mc.<zone> → 127.0.0.1:25602   hosuto-mc@bob-skyblock
-Browser ── /api/services/hosuto/* ──► Caddy ──► hosutod (127.0.0.1:8779)
-                                                   │ sudo -n /usr/local/sbin/hosuto-server
-                                                   │ RCON on 127.0.0.1 (whitelist, list, stop)
-                                                   └─ HTTP → notify, contax
+Browser ───── /api/services/hosuto/* ─────► Caddy ──► hosutod (127.0.0.1:8779)
+Desktop app ─ the same routes, Bearer ───►   ▲             │ sudo -n /usr/local/sbin/hosuto-server
+                                                           │ RCON on 127.0.0.1 (whitelist, list, stop)
+                                                           └─ HTTP → notify, contax
 ```
 
 Every server keeps `online-mode=true` and authenticates against Mojang itself. mc-router only splices
@@ -41,6 +41,30 @@ pick one and it opens four tabs:
   them (a shared `hc_*` contact group) or that you share a contax group. Enforced in the daemon.
 - **Version & Modding** — Minecraft version, mod loader, and mods from Modrinth.
 - **Client Export** — *Just the Mods* (zip), *Prism Launcher Ez2Go* (`.mrpack`), *Prism Instance* (zip).
+
+## The desktop client
+
+Client Export hands a player a bundle; the moment an operator adds a mod, that bundle is stale and
+everyone who tries to join is bounced until they fetch it again. [hosuto-desktop] closes that loop: it
+holds an isolated instance per server and re-syncs it against the server's own `.mrpack` — the same
+artifact the export tab serves, so there is no second definition of "what a player needs".
+
+Two things follow from that, and they are the reason this surface exists at all:
+
+- **The REST surface accepts a bearer token**, not just the session cookie. Both credentials are read
+  by one `resolveCaller`, shared with the MCP endpoint — the token names WHO, the kernel still decides
+  WHAT, and CSRF is skipped only for bearers, which no browser attaches on its own. A *server-scoped*
+  token stays scoped here too: it reaches only routes naming its server, and fails closed elsewhere.
+- **Pairing**, because a fresh install has no session and must never ask for the password. The browser
+  mints a single-use code (5 minutes, `pair/start`); the app trades it for a token (`pair/claim` — the
+  one unauthenticated route, since the code *is* the credential). Revoke with `DELETE mcp/token`.
+
+`Status.restartRequired` is the other half. A mod set that changes under a running world does not take
+effect until it is bounced, so the daemon says so — and says it only when it is true: adding a mod or
+changing the version always drifts, removing one only when it is client-relevant. Deleting a
+*server-only* mod changes nothing about who can join, so nobody is told to restart for it.
+
+[hosuto-desktop]: ../hosuto-desktop
 
 ## Isolation
 
