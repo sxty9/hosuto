@@ -83,6 +83,8 @@ vps)
   HOME_PUB="${1:-}"
   [ -n "$HOME_PUB" ] || die "usage: $0 vps <HEIM_PUBLIC_KEY>" 2
   ensure_tools
+  # Frische Cloud-Images bringen iptables nicht immer mit — die Weiterleitung braucht es.
+  command -v iptables >/dev/null 2>&1 || { log "installiere iptables..."; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables >/dev/null; }
   umask 077; mkdir -p "$WG_KEYDIR"
   [ -s "$WG_KEYDIR/vps_private.key" ] || wg genkey > "$WG_KEYDIR/vps_private.key"
   chmod 600 "$WG_KEYDIR/vps_private.key"
