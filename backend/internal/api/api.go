@@ -40,6 +40,7 @@ import (
 	"hosuto/internal/mcp"
 	"hosuto/internal/modrinth"
 	"hosuto/internal/notify"
+	"hosuto/internal/pairing"
 	"hosuto/internal/rights"
 	"hosuto/internal/runtime"
 	"hosuto/internal/skin"
@@ -67,6 +68,7 @@ type Server struct {
 	vc    *versions.Client
 	skin  *skin.Renderer
 	tok   *mcp.TokenStore
+	pair  *pairing.Codes
 	chats *chatstore.Store
 	hub   *chathub.Hub
 	acc   *access.Resolver
@@ -80,8 +82,14 @@ func New(v *auth.Verifier, st *store.Store, cfg *hconfig.Config, rt *runtime.Man
 	mr *modrinth.Client, vc *versions.Client, sk *skin.Renderer, tok *mcp.TokenStore,
 	chats *chatstore.Store, hub *chathub.Hub, acc *access.Resolver, ai *aigentic.Client) *Server {
 	return &Server{v: v, st: st, cfg: cfg, rt: rt, dir: dir, cx: cx, nt: nt, mc: mc, mr: mr, vc: vc,
-		skin: sk, tok: tok, chats: chats, hub: hub, acc: acc, ai: ai, http: &http.Client{Timeout: 60 * time.Second}}
+		skin: sk, tok: tok, pair: pairing.New(pairingTTL), chats: chats, hub: hub, acc: acc, ai: ai,
+		http: &http.Client{Timeout: 60 * time.Second}}
 }
+
+// pairingTTL is how long a desktop pairing code stays claimable. Long enough to walk from the browser
+// to the app, short enough that a code read over someone's shoulder is worthless by the time it is
+// tried. It takes no config: a knob here would only ever be turned the wrong way.
+const pairingTTL = 5 * time.Minute
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
 
@@ -158,6 +166,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"mcp/token", s.guard(rights.GroupPlay, false, s.mcpTokenStatus))
 	mux.HandleFunc("DELETE "+base+"mcp/token", s.guard(rights.GroupPlay, true, s.revokeMCPToken))
 
+	// Device pairing for the desktop client. start runs in the browser, where the user already has a
+	// session; claim is the one deliberately UNAUTHENTICATED route on this surface, because the caller
+	// is a freshly installed app that has no session yet — the code it presents IS the credential, and
+	// that is the entire point of pairing. See pairing.go.
+	mux.HandleFunc("POST "+base+"pair/start", s.guard(rights.GroupPlay, true, s.startPairing))
+	mux.HandleFunc("POST "+base+"pair/claim", s.claimPairing)
+
 	// The "Ask AI" chats are SHARED per server, persisted here and visible to every operator of the
 	// server — many conversations, managed like aigentic's own chat. The coarse right gates the route;
 	// controlled() enforces operator access (owner, admin, or an op-level member) inside every handler.
@@ -174,10 +189,39 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+// resolveCaller establishes WHO is calling, from either of the two credentials this surface accepts: a
+// same-origin browser presents the session cookie; a client with no browser to speak of — the Windows
+// desktop app, or an external MCP client — presents a bearer token it was minted. Either way the
+// identity is resolved to live OS groups: the credential names WHO, the kernel decides WHAT.
+//
+// It returns the server a bearer token is bound to (empty for a cookie, and for an account-wide token),
+// and whether a bearer was used at all — which is the CSRF decision. The double-submit exists because a
+// browser attaches its cookie to a cross-site request of its own accord; a bearer token, sent by
+// nothing but the client holding it, cannot suffer that, so demanding a CSRF header of it would be
+// cargo cult.
+func (s *Server) resolveCaller(r *http.Request) (*auth.User, string, bool, error) {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		subject, scope, ok := s.tok.Lookup(strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")))
+		if !ok {
+			return nil, "", true, errors.New("invalid or expired token")
+		}
+		u, ok := s.v.Resolve(subject)
+		if !ok {
+			return nil, "", true, errors.New("unknown account")
+		}
+		return u, scope, true, nil
+	}
+	u, err := s.v.User(r)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return u, "", false, nil
+}
+
 // guard authenticates, optionally requires a right, and optionally enforces the CSRF double-submit.
 func (s *Server) guard(perm string, csrf bool, h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		u, err := s.v.User(r)
+		u, scope, viaBearer, err := s.resolveCaller(r)
 		if err != nil {
 			writeErr(w, http.StatusUnauthorized, "Not authenticated")
 			return
@@ -186,12 +230,32 @@ func (s *Server) guard(perm string, csrf bool, h handler) http.HandlerFunc {
 			writeErr(w, http.StatusForbidden, "You do not have permission for this action")
 			return
 		}
-		if csrf && !s.v.CheckCSRF(r) {
+		if csrf && !viaBearer && !s.v.CheckCSRF(r) {
 			writeErr(w, http.StatusForbidden, "CSRF check failed")
+			return
+		}
+		if scope != "" && !s.boundTo(r, scope) {
+			writeErr(w, http.StatusForbidden, "This token is bound to a different server")
 			return
 		}
 		h(w, r, u)
 	}
+}
+
+// boundTo reports whether the request targets the one server a bearer token is bound to.
+//
+// A server-scoped token is a narrow credential and must stay narrow on this surface too, or minting
+// "a token for just this server" would quietly hand over every server the user can reach. Every route
+// that acts on a server names it in {id}; a route that names none is account-wide and therefore out of
+// a bound token's reach. Fail closed — the desktop client pairs an account-wide token, which is the
+// only kind that drives this surface freely.
+func (s *Server) boundTo(r *http.Request, scope string) bool {
+	ref := r.PathValue("id")
+	if ref == "" {
+		return false
+	}
+	srv, ok := s.findServer(ref)
+	return ok && srv.ID == scope
 }
 
 func (s *Server) info(w http.ResponseWriter, _ *http.Request, u *auth.User) {
@@ -341,6 +405,9 @@ func (s *Server) listServers(w http.ResponseWriter, r *http.Request, u *auth.Use
 func redact(srv store.Server) store.Server {
 	srv.RconPass = ""
 	srv.RconPort = 0
+	// Drift is reported on Status, where it is masked by the real run state — one truth, one place.
+	// Repeating the raw flag on the record would only let the two disagree.
+	srv.RestartRequired = false
 	return srv
 }
 
@@ -1246,6 +1313,9 @@ func (s *Server) setVersion(w http.ResponseWriter, r *http.Request, u *auth.User
 
 	srv.MCVersion, srv.Loader, srv.LoaderVersion = body.MCVersion, body.Loader, body.LoaderVersion
 	srv.Mods = kept
+	// Every jar under mods/ was just replaced, and exec.argv now names a different Minecraft. A live
+	// server is running none of it until it is bounced — no exceptions worth carving out here.
+	srv.RestartRequired = true
 	if err := s.st.UpdateServer(srv); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the version")
 		return

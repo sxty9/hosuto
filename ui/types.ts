@@ -80,6 +80,10 @@ export interface Status {
   max: number;
   sample?: string[];
   autostart: boolean; // comes up with the OS
+  // The live server is running a mod set that no longer matches its record. The daemon only ever
+  // reports this while the server is actually up (a stopped one reads mods/ fresh on its next start),
+  // so the UI never has to reason about when it applies — it is true exactly when it matters.
+  restartRequired?: boolean;
 }
 
 // A server as the API hands it over, with the caller's relationship to it attached.
@@ -113,6 +117,15 @@ export interface Info {
   user: string;
   zone: string; // the DNS zone every server's host hangs under
   canHost: boolean;
+}
+
+// A freshly minted pairing code: what the desktop app is handed so it can trade it for a token. host
+// travels with it because the app needs to know WHERE to claim, and making the user recall their own
+// server's address is a step that earns nothing.
+export interface PairStart {
+  code: string;
+  expires: number; // unix seconds
+  host: string;
 }
 
 export interface Player {

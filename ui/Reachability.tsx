@@ -136,6 +136,10 @@ export function Reachability({
                 {t('hosuto.playersOnline', { online: st.online, max: st.max })}
               </Badge>
             )}
+            {/* The mod set changed under the running world. Everyone sees this, not just operators: it
+                is the exact reason a player who just synced cannot get in, and the daemon only ever
+                reports it while the server is genuinely up. */}
+            {st?.restartRequired && <Badge variant="warning">{t('hosuto.restartRequired')}</Badge>}
           </Stack>
 
           {st?.sample && st.sample.length > 0 && (
@@ -152,7 +156,15 @@ export function Reachability({
               <Button variant="secondary" size="sm" disabled={busy || !running} onClick={() => void act('stop')}>
                 {t('hosuto.stop')}
               </Button>
-              <Button variant="secondary" size="sm" disabled={busy || !running} onClick={() => void act('restart')}>
+              {/* Promoted rather than duplicated: when the world is running the wrong mods, the button
+                  that fixes it is the one thing to do here — a second "apply now" control would say the
+                  same thing twice. */}
+              <Button
+                variant={st?.restartRequired ? 'primary' : 'secondary'}
+                size="sm"
+                disabled={busy || !running}
+                onClick={() => void act('restart')}
+              >
                 {t('hosuto.restart')}
               </Button>
             </Stack>

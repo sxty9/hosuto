@@ -33,6 +33,7 @@ import {
   type ServiceContextProps,
   type TranslateFn,
 } from '@holistic/ui';
+import { PairDeviceModal } from './PairDevice';
 import {
   LOADERS,
   type Account,
@@ -182,6 +183,7 @@ function AccountPanel({
   const t = useT();
   const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
+  const [pairing, setPairing] = useState(false);
 
   if (!canPlay) return null;
 
@@ -212,18 +214,26 @@ function AccountPanel({
     }
   }
 
-  // Linked: stay out of the way — a name, a face, and a way back out.
+  // Linked: stay out of the way — a name, a face, a way to bring the desktop app along, and a way back
+  // out. Pairing lives here because a paired device is a fact about the ACCOUNT, not about any one
+  // server: the token it mints reaches every server the player can already reach.
   if (account) {
     return (
-      <Stack direction="row" align="center" gap={2}>
-        <Avatar name={account.name} src={faceUrl(api, account.user, 48)} size={24} />
-        <Text variant="footnote" color="secondary">
-          {account.name}
-        </Text>
-        <Button variant="ghost" size="sm" onClick={unlink}>
-          {t('hosuto.unlink')}
-        </Button>
-      </Stack>
+      <>
+        <Stack direction="row" align="center" gap={2}>
+          <Avatar name={account.name} src={faceUrl(api, account.user, 48)} size={24} />
+          <Text variant="footnote" color="secondary">
+            {account.name}
+          </Text>
+          <Button variant="ghost" size="sm" onClick={() => setPairing(true)}>
+            {t('hosuto.pairDevice')}
+          </Button>
+          <Button variant="ghost" size="sm" onClick={unlink}>
+            {t('hosuto.unlink')}
+          </Button>
+        </Stack>
+        {pairing && <PairDeviceModal api={api} ui={ui} onClose={() => setPairing(false)} />}
+      </>
     );
   }
 

@@ -101,6 +101,7 @@ registerMessages({
     'hosuto.did.start': 'Starting',
     'hosuto.did.stop': 'Stopped',
     'hosuto.did.restart': 'Restarting',
+    'hosuto.restartRequired': 'Restart required',
     'hosuto.actionFailed': 'That did not work',
 
     'hosuto.state.active': 'Running',
@@ -125,6 +126,16 @@ registerMessages({
     'hosuto.unlink': 'Unlink',
     'hosuto.unlinkTitle': 'Unlink your Minecraft account?',
     'hosuto.unlinked': 'Account unlinked',
+
+    // ── desktop pairing ──
+    'hosuto.pairDevice': 'Desktop app',
+    'hosuto.pairTitle': 'Connect the desktop app',
+    'hosuto.pairHint': 'Enter this in the hosuto app for {host} · {left} left',
+    'hosuto.pairExpired': 'This code has expired',
+    'hosuto.pairNewCode': 'New code',
+    'hosuto.pairCopy': 'Copy',
+    'hosuto.pairFailed': 'Could not create a pairing code',
+    'hosuto.close': 'Close',
 
     // ── create ──
     'hosuto.createTitle': 'New server',

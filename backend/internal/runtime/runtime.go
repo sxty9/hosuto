@@ -59,6 +59,10 @@ type Status struct {
 	Max       int      `json:"max"`
 	Sample    []string `json:"sample,omitempty"`
 	Autostart bool     `json:"autostart"` // comes up with the OS
+	// RestartRequired: the live server is running a mod set that no longer matches its record. Only
+	// ever true while the server is actually up — a stopped one reads mods/ fresh on its next start,
+	// so telling anyone to restart it would be nonsense.
+	RestartRequired bool `json:"restartRequired,omitempty"`
 }
 
 // Manager drives server lifecycles.
@@ -291,11 +295,20 @@ func (m *Manager) SyncDefault(ctx context.Context) error {
 // Start/Stop/Restart drive the unit through the wrapper. Start and Restart re-assert hosuto's owned
 // server.properties keys first, so a server always boots with the canonical config — in particular a
 // valid rcon.password, even after a daemon restart dropped the in-memory copy. Stop needs no rewrite.
+//
+// Start and Restart are also where a pending "restart required" is answered: whatever the unit comes up
+// with IS the mod set in mods/, so the drift the record remembered is resolved by definition. Clearing
+// it here rather than in the handlers means every door — REST, the MCP tool, the in-game CLI — closes
+// the flag by doing the one thing that actually fixes it.
 func (m *Manager) Start(ctx context.Context, srv store.Server) error {
 	if err := m.writeProps(srv); err != nil {
 		return err
 	}
-	return run(ctx, "start", srv.Owner, srv.Slug)
+	if err := run(ctx, "start", srv.Owner, srv.Slug); err != nil {
+		return err
+	}
+	m.clearDrift(srv)
+	return nil
 }
 func (m *Manager) Stop(ctx context.Context, srv store.Server) error {
 	return run(ctx, "stop", srv.Owner, srv.Slug)
@@ -304,7 +317,17 @@ func (m *Manager) Restart(ctx context.Context, srv store.Server) error {
 	if err := m.writeProps(srv); err != nil {
 		return err
 	}
-	return run(ctx, "restart", srv.Owner, srv.Slug)
+	if err := run(ctx, "restart", srv.Owner, srv.Slug); err != nil {
+		return err
+	}
+	m.clearDrift(srv)
+	return nil
+}
+
+// clearDrift is best-effort: the server is up with the right mods either way, and a flag that failed to
+// clear must not turn a successful start into a reported failure. The next start clears it again.
+func (m *Manager) clearDrift(srv store.Server) {
+	_ = m.st.SetRestartRequired(srv.ID, false)
 }
 
 // Destroy stops the unit, removes the drop-in and deletes the tree — and drops the route first, so a
@@ -355,6 +378,9 @@ func (m *Manager) Status(ctx context.Context, srv store.Server) Status {
 	if st.State != "active" {
 		return st
 	}
+	// Set before the ping: a server that is up but not yet answering still has drifted mods, and that
+	// is exactly when an operator wants to be told.
+	st.RestartRequired = srv.RestartRequired
 	ping, err := mcnet.Ping(ctx, "127.0.0.1:"+strconv.Itoa(srv.Port), srv.Host, srv.Port, 2*time.Second)
 	if err != nil {
 		return st // running, but not yet answering — the world is probably still loading

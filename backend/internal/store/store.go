@@ -126,7 +126,12 @@ type Server struct {
 	JoinPolicy    string  `json:"joinPolicy"` // whitelist | open
 	Grants        []Grant `json:"grants,omitempty"`
 	Mods          []Mod   `json:"mods,omitempty"`
-	Created       int64   `json:"created"`
+	// RestartRequired records that a RUNNING server no longer matches this record's mod set — set
+	// when the set changes under a live server, cleared by Start/Restart. It is persisted because a
+	// daemon restart must not forget that the world is still running yesterday's mods, but it never
+	// leaves the daemon on the server object: Status reports it, masked by the actual run state.
+	RestartRequired bool  `json:"restartRequired,omitempty"`
+	Created         int64 `json:"created"`
 }
 
 // Loader / policy / grant vocabularies. Kept as functions rather than maps so the compiler sees
@@ -473,6 +478,24 @@ func (s *Store) RemoveMod(serverID, modID string) (Mod, error) {
 	srv.Mods = out
 	s.st.Servers[serverID] = srv
 	return removed, s.save()
+}
+
+// SetRestartRequired remembers whether the live server has drifted from its record. The store does not
+// decide WHEN that is so — it is a passive pool, and the rule (which changes a running world actually
+// cares about) lives with the operations, in api/ops.go.
+func (s *Store) SetRestartRequired(serverID string, v bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	srv, ok := s.st.Servers[serverID]
+	if !ok {
+		return ErrNotFound
+	}
+	if srv.RestartRequired == v {
+		return nil // no write for a no-op: every Start clears a flag that is usually already clear
+	}
+	srv.RestartRequired = v
+	s.st.Servers[serverID] = srv
+	return s.save()
 }
 
 // SetMods replaces a server's mod set (used when the version/loader changes and mods are re-resolved).

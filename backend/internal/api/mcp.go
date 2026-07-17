@@ -30,29 +30,17 @@ type mcpCaller struct {
 	scope string // server id, or ""
 }
 
-// authenticateMCP turns a request into an mcpCaller. Two credentials are accepted, because the
-// endpoint has two kinds of caller: an external MCP client (Claude Desktop/Code, or aigentic's
-// `claude` binary) presents a bearer token it was minted; a same-origin browser presents the session
-// cookie. Either way the identity is resolved to live OS groups — the token or cookie names WHO, the
-// kernel decides WHAT.
+// authenticateMCP turns a request into an mcpCaller. The two credentials it accepts — a minted bearer
+// token from an external MCP client (Claude Desktop/Code, or aigentic's `claude` binary), or a
+// same-origin browser's session cookie — are read by resolveCaller, which the REST guard uses too, so
+// the two doors cannot drift apart on who a caller is. Scope enforcement differs by door and stays
+// with each: here mcpTarget applies it per tool; there guard applies it per route.
 func (s *Server) authenticateMCP(r *http.Request) (any, error) {
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		token := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
-		subject, scope, ok := s.tok.Lookup(token)
-		if !ok {
-			return nil, errors.New("invalid or expired token")
-		}
-		u, ok := s.v.Resolve(subject)
-		if !ok {
-			return nil, errors.New("unknown account")
-		}
-		return &mcpCaller{user: u, scope: scope}, nil
-	}
-	u, err := s.v.User(r)
+	u, scope, _, err := s.resolveCaller(r)
 	if err != nil {
 		return nil, err
 	}
-	return &mcpCaller{user: u}, nil
+	return &mcpCaller{user: u, scope: scope}, nil
 }
 
 // mcpTarget resolves the server a tool acts on, from the connection's bound scope and/or an explicit

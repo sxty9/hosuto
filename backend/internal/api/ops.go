@@ -93,7 +93,18 @@ func (s *Server) installMod(ctx context.Context, srv store.Server, projectID str
 		added = append(added, depMod)
 		queue = append(queue, requiredDepIDs(depVer, have)...)
 	}
+	// A live server read mods/ at boot; a jar that appeared since is not in it, and no amount of
+	// waiting will change that. (A stopped server needs no such notice — Status masks the flag, and
+	// its next start reads the folder fresh.)
+	s.markRestartRequired(srv.ID)
 	return main, added, nil
+}
+
+// markRestartRequired records that the live server has drifted from its record. Best-effort on purpose:
+// the mod operation itself has already succeeded, and a flag that failed to persist must not be
+// reported to the caller as a failed install.
+func (s *Server) markRestartRequired(serverID string) {
+	_ = s.st.SetRestartRequired(serverID, true)
 }
 
 // installOne resolves one Modrinth project against the server's version/loader, downloads the jar into
@@ -145,12 +156,22 @@ func requiredDepIDs(ver modrinth.Version, have map[string]bool) []string {
 }
 
 // uninstallMod drops a mod record and deletes its jar. Returns store.ErrNotFound for an unknown mod.
+//
+// Removal is the one mod change that does not always want the world bounced, and the mod's own
+// environment says which it is. A SERVER-only mod (ClientSide "unsupported") is nothing a player has
+// or needs: dropping it changes nothing about who can join, so the live server is left alone and the
+// jar is simply gone at its next start. A client-relevant mod is the opposite — players' clients drop
+// it on their next sync while the live server still has it loaded, and until it is bounced those
+// players are locked out of the very server that told them to remove it.
 func (s *Server) uninstallMod(_ context.Context, srv store.Server, modID string) error {
 	m, err := s.st.RemoveMod(srv.ID, modID)
 	if err != nil {
 		return err
 	}
 	_ = os.Remove(filepath.Join(runtime.Dir(srv.Owner, srv.Slug), "mods", m.Filename))
+	if m.ClientSide != "unsupported" {
+		s.markRestartRequired(srv.ID)
+	}
 	return nil
 }
 
