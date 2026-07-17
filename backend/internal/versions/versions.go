@@ -607,38 +607,45 @@ func reverse(s []string) {
 
 // ── install ───────────────────────────────────────────────────────────────────────────
 
-// Install downloads, verifies and lays a server down in dir, and returns the argv the systemd unit
-// must exec (with WorkingDirectory=dir).
+// Install downloads, verifies and lays a server down in dir. It returns the argv the systemd unit
+// must exec (with WorkingDirectory=dir), and the loader version it actually installed.
 //
 // loaderVersion may be empty, in which case the newest stable build is chosen — the UI's "just
-// give me a server" path. dir must already exist: it is created by the privileged wrapper with the
-// owner's uid, and creating it here would produce a tree owned by the daemon.
-func (c *Client) Install(ctx context.Context, dir, loader, mcVersion, loaderVersion string, heapMB int) ([]string, error) {
+// give me a server" path. That choice is made HERE, per loader, so it is also reported back here:
+// the caller must record what was installed, not what was asked for. Nobody else can answer the
+// question — Paper picks the newest build on the "default" channel, which is not simply the head of
+// the public build list — and a server whose record says nothing (or says the wrong thing) cannot be
+// exported as a .mrpack or a Prism instance, both of which must name a concrete loader version. The
+// returned version is empty only for vanilla, which has no loader at all.
+//
+// dir must already exist: it is created by the privileged wrapper with the owner's uid, and creating
+// it here would produce a tree owned by the daemon.
+func (c *Client) Install(ctx context.Context, dir, loader, mcVersion, loaderVersion string, heapMB int) ([]string, string, error) {
 	if !store.ValidLoader(loader) {
-		return nil, fmt.Errorf("%w: %q", ErrUnsupportedLoader, loader)
+		return nil, "", fmt.Errorf("%w: %q", ErrUnsupportedLoader, loader)
 	}
 	if !filepath.IsAbs(dir) {
-		return nil, fmt.Errorf("%w: server dir must be absolute, got %q", ErrInvalid, dir)
+		return nil, "", fmt.Errorf("%w: server dir must be absolute, got %q", ErrInvalid, dir)
 	}
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-		return nil, fmt.Errorf("%w: server dir %s must exist", ErrInvalid, dir)
+		return nil, "", fmt.Errorf("%w: server dir %s must exist", ErrInvalid, dir)
 	}
 	if heapMB <= 0 {
-		return nil, fmt.Errorf("%w: heap must be positive, got %d", ErrInvalid, heapMB)
+		return nil, "", fmt.Errorf("%w: heap must be positive, got %d", ErrInvalid, heapMB)
 	}
 	if mcVersion == "" {
-		return nil, fmt.Errorf("%w: no minecraft version", ErrInvalid)
+		return nil, "", fmt.Errorf("%w: no minecraft version", ErrInvalid)
 	}
 
 	// Resolved before anything is downloaded: a host with no matching JRE should fail before it
 	// has spent two minutes pulling jars.
 	major, err := c.JavaMajorFor(ctx, mcVersion)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	java, err := c.javaBin(major)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	switch loader {
@@ -651,7 +658,7 @@ func (c *Client) Install(ctx context.Context, dir, loader, mcVersion, loaderVers
 	case "neoforge":
 		return c.installNeoForge(ctx, dir, mcVersion, loaderVersion, java, heapMB)
 	}
-	return nil, fmt.Errorf("%w: %q", ErrUnsupportedLoader, loader)
+	return nil, "", fmt.Errorf("%w: %q", ErrUnsupportedLoader, loader)
 }
 
 // jarArgv is the launch line for every loader that ships a runnable jar. The heap goes on the
@@ -660,38 +667,40 @@ func jarArgv(java, jar string, heapMB int) []string {
 	return []string{java, fmt.Sprintf("-Xms%dM", heapMB), fmt.Sprintf("-Xmx%dM", heapMB), "-jar", jar, "nogui"}
 }
 
-func (c *Client) installVanilla(ctx context.Context, dir, mcVersion, java string, heapMB int) ([]string, error) {
+// vanilla has no loader, so it reports no loader version — the one honest empty string in Install's
+// contract.
+func (c *Client) installVanilla(ctx context.Context, dir, mcVersion, java string, heapMB int) ([]string, string, error) {
 	vm, err := c.versionMeta(ctx, mcVersion)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if vm.Downloads.Server.URL == "" {
 		// True for the old_alpha/old_beta tail: Mojang never published a server jar for them.
-		return nil, fmt.Errorf("%w: minecraft %s publishes no server jar", ErrUnknownVersion, mcVersion)
+		return nil, "", fmt.Errorf("%w: minecraft %s publishes no server jar", ErrUnknownVersion, mcVersion)
 	}
 	jar := filepath.Join(dir, "server.jar")
 	// Mojang publishes SHA-1, not SHA-256. Verifying with the wrong algorithm would fail every
 	// install; verifying with none would install anything the CDN handed us.
 	if err := c.download(ctx, vm.Downloads.Server.URL, jar, "sha1", vm.Downloads.Server.SHA1); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return jarArgv(java, jar, heapMB), nil
+	return jarArgv(java, jar, heapMB), "", nil
 }
 
-func (c *Client) installFabric(ctx context.Context, dir, mcVersion, loaderVersion, java string, heapMB int) ([]string, error) {
+func (c *Client) installFabric(ctx context.Context, dir, mcVersion, loaderVersion, java string, heapMB int) ([]string, string, error) {
 	if loaderVersion == "" {
 		vs, err := c.fabricLoaders(ctx)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if len(vs) == 0 {
-			return nil, fmt.Errorf("%w: fabric publishes no loader versions", ErrUnknownVersion)
+			return nil, "", fmt.Errorf("%w: fabric publishes no loader versions", ErrUnknownVersion)
 		}
 		loaderVersion = vs[0]
 	}
 	installer, err := c.fabricInstaller(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// Fabric's meta service assembles a launchable server jar on demand. It publishes no digest
 	// for it (the jar is generated per request), so this is the one download with nothing to check
@@ -700,15 +709,15 @@ func (c *Client) installFabric(ctx context.Context, dir, mcVersion, loaderVersio
 		c.fabricBase, mcVersion, loaderVersion, installer)
 	jar := filepath.Join(dir, "fabric-server-launch.jar")
 	if err := c.download(ctx, url, jar, "", ""); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return jarArgv(java, jar, heapMB), nil
+	return jarArgv(java, jar, heapMB), loaderVersion, nil
 }
 
-func (c *Client) installPaper(ctx context.Context, dir, mcVersion, build, java string, heapMB int) ([]string, error) {
+func (c *Client) installPaper(ctx context.Context, dir, mcVersion, build, java string, heapMB int) ([]string, string, error) {
 	bl, err := c.paperBuildList(ctx, mcVersion)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// Pick the requested build, or the newest stable one. Paper's list is ascending, so the last
 	// match wins.
@@ -724,33 +733,35 @@ func (c *Client) installPaper(ctx context.Context, dir, mcVersion, build, java s
 		name, sum, chosen = b.Downloads.Application.Name, b.Downloads.Application.SHA256, b.Build
 	}
 	if chosen == 0 {
-		return nil, fmt.Errorf("%w: paper build %q for minecraft %s", ErrUnknownVersion, build, mcVersion)
+		return nil, "", fmt.Errorf("%w: paper build %q for minecraft %s", ErrUnknownVersion, build, mcVersion)
 	}
 	url := fmt.Sprintf("%s/versions/%s/builds/%d/downloads/%s", c.paperBase, mcVersion, chosen, name)
 	jar := filepath.Join(dir, "server.jar")
 	// Paper publishes SHA-256 (unlike Mojang's SHA-1).
 	if err := c.download(ctx, url, jar, "sha256", sum); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return jarArgv(java, jar, heapMB), nil
+	// The build actually taken — not the head of the public list, which includes channels this
+	// installer skips.
+	return jarArgv(java, jar, heapMB), strconv.Itoa(chosen), nil
 }
 
 // installNeoForge runs the official installer headlessly. NeoForge does not ship a fat server jar:
 // the installer materialises run.sh, libraries/ and the @argfiles that the launch line references.
-func (c *Client) installNeoForge(ctx context.Context, dir, mcVersion, version, java string, heapMB int) ([]string, error) {
+func (c *Client) installNeoForge(ctx context.Context, dir, mcVersion, version, java string, heapMB int) ([]string, string, error) {
 	if version == "" {
 		vs, err := c.neoforgeVersions(ctx, mcVersion)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if len(vs) == 0 {
-			return nil, fmt.Errorf("%w: neoforge has no build for minecraft %s", ErrUnknownVersion, mcVersion)
+			return nil, "", fmt.Errorf("%w: neoforge has no build for minecraft %s", ErrUnknownVersion, mcVersion)
 		}
 		version = vs[0]
 	} else if mc, _, ok := neoforgeMC(version); !ok || mc != mcVersion {
 		// A NeoForge version encodes its Minecraft version, so a mismatch is caught here rather
 		// than by a confusing crash on first boot.
-		return nil, fmt.Errorf("%w: neoforge %s does not target minecraft %s", ErrInvalid, version, mcVersion)
+		return nil, "", fmt.Errorf("%w: neoforge %s does not target minecraft %s", ErrInvalid, version, mcVersion)
 	}
 
 	base := fmt.Sprintf("%s/%s/neoforge-%s-installer.jar", c.neoBase, version, version)
@@ -759,21 +770,21 @@ func (c *Client) installNeoForge(ctx context.Context, dir, mcVersion, version, j
 	// a missing sidecar is not fatal, a wrong digest always is.
 	sum, err := c.mavenSHA1(ctx, base+".sha1")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := c.download(ctx, base, installer, "sha1", sum); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer os.Remove(installer) // the installer jar is build-time only; it must not sit in the server dir
 
 	if err := c.runInstaller(ctx, java, installer, dir); err != nil {
-		return nil, fmt.Errorf("neoforge installer %s: %w", version, err)
+		return nil, "", fmt.Errorf("neoforge installer %s: %w", version, err)
 	}
 
 	// The heap MUST go in user_jvm_args.txt: the launch line is an @argfile pair, and JVM flags
 	// passed after them are ignored by the game's own arg parsing.
 	if err := writeJVMArgs(filepath.Join(dir, "user_jvm_args.txt"), heapMB); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// Prefer exec'ing java directly over run.sh: systemd then owns the JVM process itself, so
@@ -781,16 +792,16 @@ func (c *Client) installNeoForge(ctx context.Context, dir, mcVersion, version, j
 	// layouts that do not produce unix_args.txt.
 	unixArgs := filepath.Join(dir, "libraries", "net", "neoforged", "neoforge", version, "unix_args.txt")
 	if _, err := os.Stat(unixArgs); err == nil {
-		return []string{java, "@" + filepath.Join(dir, "user_jvm_args.txt"), "@" + unixArgs, "nogui"}, nil
+		return []string{java, "@" + filepath.Join(dir, "user_jvm_args.txt"), "@" + unixArgs, "nogui"}, version, nil
 	}
 	run := filepath.Join(dir, "run.sh")
 	if fi, err := os.Stat(run); err == nil && fi.Mode().IsRegular() {
 		if err := os.Chmod(run, 0o755); err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return []string{run, "nogui"}, nil
+		return []string{run, "nogui"}, version, nil
 	}
-	return nil, fmt.Errorf("neoforge %s: installer produced neither %s nor run.sh", version, unixArgs)
+	return nil, "", fmt.Errorf("neoforge %s: installer produced neither %s nor run.sh", version, unixArgs)
 }
 
 // writeJVMArgs sets the heap in NeoForge's user_jvm_args.txt, preserving the installer's comments

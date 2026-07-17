@@ -387,7 +387,7 @@ func TestNeoforgeMC(t *testing.T) {
 func TestInstallVanilla(t *testing.T) {
 	f := newFake(t)
 	dir := t.TempDir()
-	argv, err := f.c.Install(context.Background(), dir, "vanilla", "1.21.1", "", 2048)
+	argv, resolved, err := f.c.Install(context.Background(), dir, "vanilla", "1.21.1", "", 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,6 +395,10 @@ func TestInstallVanilla(t *testing.T) {
 	want := []string{"/jvm/21/java", "-Xms2048M", "-Xmx2048M", "-jar", jar, "nogui"}
 	if !reflect.DeepEqual(argv, want) {
 		t.Errorf("argv = %v, want %v", argv, want)
+	}
+	// Vanilla has no loader, so it must claim no loader version rather than invent one.
+	if resolved != "" {
+		t.Errorf("resolved loader version = %q, want empty for vanilla", resolved)
 	}
 	b, err := os.ReadFile(jar)
 	if err != nil {
@@ -409,7 +413,7 @@ func TestInstallVanillaHashMismatch(t *testing.T) {
 	f := newFake(t)
 	dir := t.TempDir()
 	// 1.20.4's meta advertises a digest that does not match the served bytes.
-	_, err := f.c.Install(context.Background(), dir, "vanilla", "1.20.4", "", 1024)
+	_, _, err := f.c.Install(context.Background(), dir, "vanilla", "1.20.4", "", 1024)
 	if !errors.Is(err, ErrHashMismatch) {
 		t.Fatalf("err = %v, want ErrHashMismatch", err)
 	}
@@ -424,7 +428,7 @@ func TestInstallVanillaHashMismatch(t *testing.T) {
 func TestInstallVanillaNoServerJar(t *testing.T) {
 	f := newFake(t)
 	// The old_beta tail has no server download; the error must say so rather than 404 obscurely.
-	_, err := f.c.Install(context.Background(), t.TempDir(), "vanilla", "b1.7.3", "", 1024)
+	_, _, err := f.c.Install(context.Background(), t.TempDir(), "vanilla", "b1.7.3", "", 1024)
 	if !errors.Is(err, ErrUnknownVersion) {
 		t.Fatalf("err = %v, want ErrUnknownVersion", err)
 	}
@@ -435,7 +439,7 @@ func TestInstallFabric(t *testing.T) {
 	dir := t.TempDir()
 	// An empty loader version must resolve to the newest stable loader (0.16.14) and the newest
 	// stable installer (1.0.3) — the fake only serves that exact path.
-	argv, err := f.c.Install(context.Background(), dir, "fabric", "1.21.1", "", 4096)
+	argv, resolved, err := f.c.Install(context.Background(), dir, "fabric", "1.21.1", "", 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,6 +450,11 @@ func TestInstallFabric(t *testing.T) {
 	}
 	if _, err := os.Stat(jar); err != nil {
 		t.Errorf("fabric launch jar not installed: %v", err)
+	}
+	// The whole point of reporting it: the caller asked for "" and must learn which loader that
+	// actually became, or the server record can never name what it is running.
+	if resolved != "0.16.14" {
+		t.Errorf("resolved loader version = %q, want 0.16.14 (the newest stable)", resolved)
 	}
 }
 
@@ -465,7 +474,7 @@ func TestInstallPaper(t *testing.T) {
 		})
 
 	dir := t.TempDir()
-	argv, err := f.c.Install(context.Background(), dir, "paper", "1.20.4", "", 1024)
+	argv, resolved, err := f.c.Install(context.Background(), dir, "paper", "1.20.4", "", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,12 +486,17 @@ func TestInstallPaper(t *testing.T) {
 	if _, err := os.Stat(jar); err != nil {
 		t.Errorf("paper jar not installed: %v", err)
 	}
+	// Paper is why the installer, not the catalogue, must answer this: it takes the newest build on
+	// the "default" channel, which the public build list does not simply end with.
+	if resolved != "9" {
+		t.Errorf("resolved build = %q, want 9 (newest default-channel build)", resolved)
+	}
 	// An explicit build must be honoured.
-	if _, err := f.c.Install(context.Background(), t.TempDir(), "paper", "1.20.4", "8", 1024); err != nil {
+	if _, _, err := f.c.Install(context.Background(), t.TempDir(), "paper", "1.20.4", "8", 1024); err != nil {
 		t.Errorf("explicit build 8: %v", err)
 	}
 	// A build the version does not have must fail, not silently install the newest.
-	if _, err := f.c.Install(context.Background(), t.TempDir(), "paper", "1.20.4", "999", 1024); !errors.Is(err, ErrUnknownVersion) {
+	if _, _, err := f.c.Install(context.Background(), t.TempDir(), "paper", "1.20.4", "999", 1024); !errors.Is(err, ErrUnknownVersion) {
 		t.Errorf("unknown build: err = %v, want ErrUnknownVersion", err)
 	}
 }
@@ -538,9 +552,12 @@ func TestInstallNeoForge(t *testing.T) {
 	f := neoFake(t, neoModernLayout(t, version))
 	dir := t.TempDir()
 
-	argv, err := f.c.Install(context.Background(), dir, "neoforge", "1.21.1", version, 6144)
+	argv, resolved, err := f.c.Install(context.Background(), dir, "neoforge", "1.21.1", version, 6144)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if resolved != version {
+		t.Errorf("resolved version = %q, want the requested %q", resolved, version)
 	}
 
 	// java is exec'd directly against the argfiles rather than through run.sh, so systemd owns the
@@ -582,13 +599,17 @@ func TestInstallNeoForgeRunShFallback(t *testing.T) {
 		}
 	})
 	dir := t.TempDir()
-	argv, err := f.c.Install(context.Background(), dir, "neoforge", "1.21.1", "21.1.235", 2048)
+	argv, resolved, err := f.c.Install(context.Background(), dir, "neoforge", "1.21.1", "21.1.235", 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
 	run := filepath.Join(dir, "run.sh")
 	if want := []string{run, "nogui"}; !reflect.DeepEqual(argv, want) {
 		t.Errorf("argv = %v, want %v", argv, want)
+	}
+	// The fallback layout must still report its version — an exported pack needs it either way.
+	if resolved != "21.1.235" {
+		t.Errorf("resolved version = %q, want 21.1.235", resolved)
 	}
 	// systemd cannot exec a file that is not executable, and the installer does not always chmod it.
 	fi, err := os.Stat(run)
@@ -608,7 +629,7 @@ func TestInstallNeoForgeNoLaunchable(t *testing.T) {
 	// The installer "succeeded" but produced neither launch path: fail loudly rather than hand
 	// back an argv that cannot start.
 	f := neoFake(t, func(string) {})
-	_, err := f.c.Install(context.Background(), t.TempDir(), "neoforge", "1.21.1", "21.1.235", 1024)
+	_, _, err := f.c.Install(context.Background(), t.TempDir(), "neoforge", "1.21.1", "21.1.235", 1024)
 	if err == nil {
 		t.Fatal("want an error when the installer produces no launchable layout")
 	}
@@ -632,7 +653,7 @@ func TestInstallNeoForgeBadSidecar(t *testing.T) {
 	f.c.runInstaller = func(context.Context, string, string, string) error { ran = true; return nil }
 
 	dir := t.TempDir()
-	_, err := f.c.Install(context.Background(), dir, "neoforge", "1.21.1", "21.1.235", 1024)
+	_, _, err := f.c.Install(context.Background(), dir, "neoforge", "1.21.1", "21.1.235", 1024)
 	if !errors.Is(err, ErrHashMismatch) {
 		t.Fatalf("err = %v, want ErrHashMismatch", err)
 	}
@@ -649,19 +670,22 @@ func TestInstallNeoForgeBadSidecar(t *testing.T) {
 func TestInstallNeoForgePicksNewestStable(t *testing.T) {
 	f := neoFake(t, neoModernLayout(t, "21.1.235"))
 	dir := t.TempDir()
-	argv, err := f.c.Install(context.Background(), dir, "neoforge", "1.21.1", "", 1024)
+	argv, resolved, err := f.c.Install(context.Background(), dir, "neoforge", "1.21.1", "", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(strings.Join(argv, " "), "neoforge/21.1.235/unix_args.txt") {
 		t.Errorf("argv = %v, want the 21.1.235 argfile", argv)
 	}
+	if resolved != "21.1.235" {
+		t.Errorf("resolved version = %q, want 21.1.235 (newest stable, not the beta above it)", resolved)
+	}
 }
 
 func TestInstallNeoForgeVersionMismatch(t *testing.T) {
 	f := newFake(t)
 	// 21.1.235 targets 1.21.1, not 1.20.4: caught before anything is downloaded.
-	_, err := f.c.Install(context.Background(), t.TempDir(), "neoforge", "1.20.4", "21.1.235", 1024)
+	_, _, err := f.c.Install(context.Background(), t.TempDir(), "neoforge", "1.20.4", "21.1.235", 1024)
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("err = %v, want ErrInvalid", err)
 	}
@@ -675,24 +699,24 @@ func TestInstallRejectsBadArgs(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
-	if _, err := f.c.Install(ctx, dir, "forge", "1.21.1", "", 1024); !errors.Is(err, ErrUnsupportedLoader) {
+	if _, _, err := f.c.Install(ctx, dir, "forge", "1.21.1", "", 1024); !errors.Is(err, ErrUnsupportedLoader) {
 		t.Errorf("bad loader: err = %v, want ErrUnsupportedLoader", err)
 	}
-	if _, err := f.c.Install(ctx, "relative/dir", "vanilla", "1.21.1", "", 1024); !errors.Is(err, ErrInvalid) {
+	if _, _, err := f.c.Install(ctx, "relative/dir", "vanilla", "1.21.1", "", 1024); !errors.Is(err, ErrInvalid) {
 		t.Errorf("relative dir: err = %v, want ErrInvalid", err)
 	}
 	// The dir is created by the privileged wrapper with the owner's uid; Install must not make one.
 	missing := filepath.Join(dir, "nope")
-	if _, err := f.c.Install(ctx, missing, "vanilla", "1.21.1", "", 1024); !errors.Is(err, ErrInvalid) {
+	if _, _, err := f.c.Install(ctx, missing, "vanilla", "1.21.1", "", 1024); !errors.Is(err, ErrInvalid) {
 		t.Errorf("missing dir: err = %v, want ErrInvalid", err)
 	}
 	if _, err := os.Stat(missing); !os.IsNotExist(err) {
 		t.Error("Install created the server dir; that tree must be owned by the server's owner")
 	}
-	if _, err := f.c.Install(ctx, dir, "vanilla", "1.21.1", "", 0); !errors.Is(err, ErrInvalid) {
+	if _, _, err := f.c.Install(ctx, dir, "vanilla", "1.21.1", "", 0); !errors.Is(err, ErrInvalid) {
 		t.Errorf("zero heap: err = %v, want ErrInvalid", err)
 	}
-	if _, err := f.c.Install(ctx, dir, "vanilla", "", "", 1024); !errors.Is(err, ErrInvalid) {
+	if _, _, err := f.c.Install(ctx, dir, "vanilla", "", "", 1024); !errors.Is(err, ErrInvalid) {
 		t.Errorf("empty mc version: err = %v, want ErrInvalid", err)
 	}
 }

@@ -153,10 +153,15 @@ func (m *Manager) Create(ctx context.Context, srv store.Server) (store.Server, e
 	}
 
 	// Install the jar/loader. This is the slow part (a download plus, for NeoForge, an installer run).
-	argv, err := m.vc.Install(ctx, dir, srv.Loader, srv.MCVersion, srv.LoaderVersion, srv.HeapMB)
+	//
+	// Record the version Install actually chose, not the one that was asked for: "" means "give me the
+	// newest", and a record that still says "" afterwards cannot be exported as a .mrpack or a Prism
+	// instance — both must name a concrete loader version — nor can it tell anyone what is running.
+	argv, resolved, err := m.vc.Install(ctx, dir, srv.Loader, srv.MCVersion, srv.LoaderVersion, srv.HeapMB)
 	if err != nil {
 		return srv, fmt.Errorf("install %s %s: %w", srv.Loader, srv.MCVersion, err)
 	}
+	srv.LoaderVersion = resolved
 	// The unit reads its ExecStart argv from this file, so a version/loader change is a file write
 	// plus a restart — no unit rewrite, no daemon-reload.
 	if err := os.WriteFile(filepath.Join(dir, "exec.argv"), []byte(strings.Join(argv, "\n")+"\n"), 0o640); err != nil {

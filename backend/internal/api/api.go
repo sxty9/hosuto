@@ -1275,7 +1275,7 @@ func (s *Server) setVersion(w http.ResponseWriter, r *http.Request, u *auth.User
 		return
 	}
 
-	argv, err := s.vc.Install(ctx, dir, body.Loader, body.MCVersion, body.LoaderVersion, srv.HeapMB)
+	argv, resolvedLoader, err := s.vc.Install(ctx, dir, body.Loader, body.MCVersion, body.LoaderVersion, srv.HeapMB)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -1311,7 +1311,9 @@ func (s *Server) setVersion(w http.ResponseWriter, r *http.Request, u *auth.User
 		kept = append(kept, m)
 	}
 
-	srv.MCVersion, srv.Loader, srv.LoaderVersion = body.MCVersion, body.Loader, body.LoaderVersion
+	// resolvedLoader, not body.LoaderVersion: an empty request means "newest", and Install is the only
+	// thing that knows which one that turned out to be.
+	srv.MCVersion, srv.Loader, srv.LoaderVersion = body.MCVersion, body.Loader, resolvedLoader
 	srv.Mods = kept
 	// Every jar under mods/ was just replaced, and exec.argv now names a different Minecraft. A live
 	// server is running none of it until it is bounced — no exceptions worth carving out here.
@@ -1389,8 +1391,11 @@ func (s *Server) fetcher(ctx context.Context) export.Fetcher {
 // signalled by cutting the connection, which the browser sees as a truncated (invalid) archive. That
 // is the honest failure, and it is strictly better than a silently incomplete modpack that fails at
 // the player's end with a cryptic crash.
+// write receives the io.Writer to pack into — the counting wrapper below, never the raw
+// ResponseWriter. Handing it over rather than letting each caller close over w is what keeps the byte
+// count honest, and the count is the whole basis on which a failure is reported or aborted.
 func (s *Server) sendExport(w http.ResponseWriter, r *http.Request, u *auth.User, suffix string,
-	write func(srv store.Server, jarDir string) error) {
+	write func(dst io.Writer, srv store.Server, jarDir string) error) {
 	srv, ok := s.visible(r, u)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "No such server")
@@ -1400,30 +1405,57 @@ func (s *Server) sendExport(w http.ResponseWriter, r *http.Request, u *auth.User
 		writeErr(w, http.StatusBadRequest, "This server has no client mods to export")
 		return
 	}
+	jarDir := filepath.Join(runtime.Dir(srv.Owner, srv.Slug), "mods")
+
+	// Count what reaches the client, because that decides how a failure may be reported.
+	//
+	// Once the first byte is out the status line is already sent, and the only honest way to end a
+	// broken stream is to break the connection: ErrAbortHandler does exactly that, without the stack
+	// trace a real panic would log. But an export can also fail with nothing written at all — a
+	// server whose record names no loader version cannot be packed — and aborting THAT looks to the
+	// browser like the download simply evaporated. It is reported as what it is instead.
+	cw := &countingWriter{ResponseWriter: w}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+srv.Slug+"-"+suffix+`"`)
 	w.Header().Set("Cache-Control", "no-store")
-	jarDir := filepath.Join(runtime.Dir(srv.Owner, srv.Slug), "mods")
-	if err := write(srv, jarDir); err != nil {
-		panic(http.ErrAbortHandler)
+	if err := write(cw, srv, jarDir); err != nil {
+		if cw.n > 0 {
+			panic(http.ErrAbortHandler)
+		}
+		// Nothing was committed, so this is an ordinary error response after all — and it must stop
+		// looking like a download, or the browser saves the error as a file called "<slug>-prism.zip".
+		w.Header().Del("Content-Disposition")
+		writeErr(w, http.StatusConflict, err.Error())
 	}
 }
 
+// countingWriter reports whether a handler has already committed bytes to the client.
+type countingWriter struct {
+	http.ResponseWriter
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
 func (s *Server) exportMods(w http.ResponseWriter, r *http.Request, u *auth.User) {
-	s.sendExport(w, r, u, "mods.zip", func(srv store.Server, jarDir string) error {
-		return export.WriteModsZip(w, srv.Mods, jarDir, s.fetcher(r.Context()))
+	s.sendExport(w, r, u, "mods.zip", func(dst io.Writer, srv store.Server, jarDir string) error {
+		return export.WriteModsZip(dst, srv.Mods, jarDir, s.fetcher(r.Context()))
 	})
 }
 
 func (s *Server) exportMrpack(w http.ResponseWriter, r *http.Request, u *auth.User) {
-	s.sendExport(w, r, u, "ez2go.mrpack", func(srv store.Server, jarDir string) error {
-		return export.WriteMrpack(w, srv, jarDir, s.fetcher(r.Context()))
+	s.sendExport(w, r, u, "ez2go.mrpack", func(dst io.Writer, srv store.Server, jarDir string) error {
+		return export.WriteMrpack(dst, srv, jarDir, s.fetcher(r.Context()))
 	})
 }
 
 func (s *Server) exportPrism(w http.ResponseWriter, r *http.Request, u *auth.User) {
-	s.sendExport(w, r, u, "prism.zip", func(srv store.Server, jarDir string) error {
-		return export.WritePrismZip(w, srv, jarDir, s.fetcher(r.Context()))
+	s.sendExport(w, r, u, "prism.zip", func(dst io.Writer, srv store.Server, jarDir string) error {
+		return export.WritePrismZip(dst, srv, jarDir, s.fetcher(r.Context()))
 	})
 }
 
