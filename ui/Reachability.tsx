@@ -24,6 +24,8 @@ import type { Diagnose, RunState, ServerView, Status } from './types';
 const DOT: Record<RunState, string> = {
   active: 'bg-success',
   activating: 'bg-warning',
+  deactivating: 'bg-warning',
+  reloading: 'bg-warning',
   inactive: 'bg-fill/40',
   failed: 'bg-danger',
 };
