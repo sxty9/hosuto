@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -67,13 +68,18 @@ type Account struct {
 // solved exactly this problem: let an owner share a resource with a person, a contax personal
 // group, or an OS group, and resolve membership live at request time.
 //
-//	adhoc    — the owner picked specific people; Members holds their Linux usernames.
-//	contax   — Ref is a contax personal group id (grp-xxxxxxxx); membership is resolved live.
-//	holistic — Ref is an OS group name (e.g. an hc_* contact group); membership is the Linux group.
+//	adhoc     — the owner picked specific people; Members holds their Linux usernames.
+//	contax    — Ref is a contax personal group id (grp-xxxxxxxx); membership is resolved live.
+//	holistic  — Ref is an OS group name (e.g. an hc_* contact group); membership is the Linux group.
+//	minecraft — Ref is a dashed Mojang UUID: a game account admitted directly, with nobody in this
+//	            landscape behind it. It is the one kind that resolves to no Linux user at all, so it
+//	            grants the right to JOIN and nothing else — never dashboard access. Should that
+//	            player later link the same account to a holistic user, access.Resolve finds them by
+//	            UUID and the grant starts covering the person too, with no second grant to add.
 type Grant struct {
 	ID      string   `json:"id"`
-	Kind    string   `json:"kind"`  // adhoc | contax | holistic
-	Ref     string   `json:"ref"`   // contax: grp-id · holistic: group name · adhoc: ""
+	Kind    string   `json:"kind"`  // adhoc | contax | holistic | minecraft
+	Ref     string   `json:"ref"`   // contax: grp-id · holistic: group name · minecraft: uuid · adhoc: ""
 	Label   string   `json:"label"` // display label
 	Level   string   `json:"level"` // play | op
 	Members []string `json:"members,omitempty"`
@@ -140,7 +146,9 @@ func ValidLoader(l string) bool {
 	return l == "vanilla" || l == "fabric" || l == "neoforge" || l == "paper"
 }
 func ValidPolicy(p string) bool { return p == "whitelist" || p == "open" }
-func ValidKind(k string) bool   { return k == "adhoc" || k == "contax" || k == "holistic" }
+func ValidKind(k string) bool {
+	return k == "adhoc" || k == "contax" || k == "holistic" || k == "minecraft"
+}
 func ValidLevel(l string) bool  { return l == "play" || l == "op" }
 
 // ModsOnly reports whether this loader runs client-side mods at all. Paper runs Bukkit PLUGINS,
@@ -148,9 +156,41 @@ func ValidLevel(l string) bool  { return l == "play" || l == "op" }
 // offer an export that would always be empty.
 func LoaderHasClientMods(l string) bool { return l == "fabric" || l == "neoforge" }
 
+// Template is a saved server RECIPE: what a server was made of, so another one can be made the same
+// way. It is created from an existing server and instantiated into a new one.
+//
+// The recipe lives here; the FILES it carries (config/, mods/, and the world when the creator asked
+// for it) live in a payload zip beside the state file, named by ID. The split is the store's usual
+// rule applied to a new entity — the store holds what hosuto knows, never a mirror of what is on
+// disk — and it is what keeps state.json small when a template is four gigabytes of world.
+//
+// Mods is copied from the source server rather than re-derived from the payload: a Modrinth-resolved
+// mod records its project and version, so instantiating a template can restore that provenance
+// instead of degrading every mod to an anonymous jar the Modding tab cannot act on.
+type Template struct {
+	ID            string `json:"id"`   // tpl-xxxxxxxx
+	Name          string `json:"name"`
+	Owner         string `json:"owner"` // Linux username; templates are owned like servers are
+	Game          string `json:"game"`
+	MCVersion     string `json:"mcVersion"`
+	Loader        string `json:"loader"`
+	LoaderVersion string `json:"loaderVersion,omitempty"`
+	HeapMB        int    `json:"heapMB"`
+	JoinPolicy    string `json:"joinPolicy"`
+	Mods          []Mod  `json:"mods,omitempty"`
+	// IncludeWorld records what the creator chose. A template without a world starts every server
+	// from a fresh one; a template with it is a clone, and the UI must be able to say which it is
+	// before someone instantiates four gigabytes by accident.
+	IncludeWorld bool  `json:"includeWorld"`
+	Size         int64 `json:"size"` // payload bytes, for the same reason
+	SourceSlug   string `json:"sourceSlug,omitempty"`
+	Created      int64  `json:"created"`
+}
+
 type state struct {
-	Accounts map[string]Account `json:"accounts"` // keyed by Linux username
-	Servers  map[string]Server  `json:"servers"`  // keyed by server id
+	Accounts  map[string]Account  `json:"accounts"`            // keyed by Linux username
+	Servers   map[string]Server   `json:"servers"`             // keyed by server id
+	Templates map[string]Template `json:"templates,omitempty"` // keyed by template id
 }
 
 // Store is the daemon's sole writer of hosuto state.
@@ -165,7 +205,9 @@ func Open(path string) (*Store, error) {
 	if path == "" {
 		path = DefaultPath
 	}
-	s := &Store{path: path, st: state{Accounts: map[string]Account{}, Servers: map[string]Server{}}}
+	s := &Store{path: path, st: state{
+		Accounts: map[string]Account{}, Servers: map[string]Server{}, Templates: map[string]Template{},
+	}}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -184,6 +226,11 @@ func Open(path string) (*Store, error) {
 	}
 	if s.st.Servers == nil {
 		s.st.Servers = map[string]Server{}
+	}
+	// Absent in every state file written before templates existed, so it is created rather than
+	// assumed — the same reason Accounts and Servers are checked above.
+	if s.st.Templates == nil {
+		s.st.Templates = map[string]Template{}
 	}
 	return s, nil
 }
@@ -365,6 +412,7 @@ func (s *Store) CreateServer(srv Server) (Server, error) {
 	srv.ID = genID("srv-")
 	srv.Game = "minecraft"
 	srv.Created = time.Now().Unix()
+	srv.Mods = identifyMods(srv.Mods)
 	s.st.Servers[srv.ID] = srv
 	return srv, s.save()
 }
@@ -376,6 +424,7 @@ func (s *Store) UpdateServer(srv Server) error {
 	if _, ok := s.st.Servers[srv.ID]; !ok {
 		return ErrNotFound
 	}
+	srv.Mods = identifyMods(srv.Mods)
 	s.st.Servers[srv.ID] = srv
 	return s.save()
 }
@@ -498,7 +547,61 @@ func (s *Store) SetRestartRequired(serverID string, v bool) error {
 	return s.save()
 }
 
-// SetMods replaces a server's mod set (used when the version/loader changes and mods are re-resolved).
+// ── templates ─────────────────────────────────────────────────────────────────────────
+
+// Template returns one template by id.
+func (s *Store) Template(id string) (Template, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.st.Templates[id]
+	return t, ok
+}
+
+// Templates returns every template, newest first — a template list is read chronologically ("the one
+// I just made"), unlike the server list which is read by name.
+func (s *Store) Templates() []Template {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Template, 0, len(s.st.Templates))
+	for _, v := range s.st.Templates {
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Created > out[j].Created })
+	return out
+}
+
+// CreateTemplate registers a template. The caller has already written the payload zip.
+func (s *Store) CreateTemplate(t Template) (Template, error) {
+	if strings.TrimSpace(t.Name) == "" || t.Owner == "" || !ValidLoader(t.Loader) {
+		return Template{}, ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t.ID = genID("tpl-")
+	t.Game = "minecraft"
+	t.Created = time.Now().Unix()
+	s.st.Templates[t.ID] = t
+	return t, s.save()
+}
+
+// DeleteTemplate drops a template record. The caller deletes the payload.
+func (s *Store) DeleteTemplate(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.st.Templates[id]; !ok {
+		return ErrNotFound
+	}
+	delete(s.st.Templates, id)
+	return s.save()
+}
+
+// SetMods replaces a server's mod set — used when the version/loader changes and every mod is
+// re-resolved, and when a migrated or templated server adopts the mods that came with it.
+//
+// An entry with no id gets one here, and so does an entry with no timestamp. Identity is the store's
+// to assign (AddMod does the same), and a mod without an id is not merely untidy: every operation
+// the UI offers addresses a mod by id, so one that shipped without would be listed and then be
+// impossible to remove.
 func (s *Store) SetMods(serverID string, mods []Mod) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -506,7 +609,29 @@ func (s *Store) SetMods(serverID string, mods []Mod) error {
 	if !ok {
 		return ErrNotFound
 	}
-	srv.Mods = mods
+	srv.Mods = identifyMods(mods)
 	s.st.Servers[serverID] = srv
 	return s.save()
+}
+
+// identifyMods gives every mod an id and a timestamp. It runs on every write path that can carry a
+// mod set (CreateServer, UpdateServer, SetMods), so the invariant holds regardless of how the set
+// got here — a mod restored from a template or adopted from a migration arrives without one, and no
+// caller should have to remember that.
+func identifyMods(mods []Mod) []Mod {
+	if len(mods) == 0 {
+		return mods
+	}
+	now := time.Now().Unix()
+	out := make([]Mod, 0, len(mods))
+	for _, m := range mods {
+		if m.ID == "" {
+			m.ID = genID("mod-")
+		}
+		if m.Added == 0 {
+			m.Added = now
+		}
+		out = append(out, m)
+	}
+	return out
 }

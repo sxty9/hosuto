@@ -2,14 +2,19 @@
 //
 // Two things live here, and they are deliberately separate:
 //
-//   GRANTS  — the rules ("Bob", "my Minecraft group"). This is what the owner edits.
+//   GRANTS  — the rules ("Bob", "my Minecraft group", "Notch"). This is what the owner edits.
 //   PLAYERS — the people those rules currently resolve to. This is what the whitelist becomes.
 //
 // A contax group grant is never flattened into its members: contax owns its groups, and hosuto
 // re-resolves them on every join. That is why the picker below cannot simply hand us addresses —
 // see the note on expandGroup.
+//
+// A player need not be a member here at all: a Minecraft account can be admitted by name, and then
+// the grant carries a game identity with nobody behind it. Those two ways in share one dialog and
+// one level, because "let this person play" is one intent — not two features.
 import { useCallback, useRef, useState } from 'react';
 import {
+  Autocomplete,
   Avatar,
   Badge,
   Box,
@@ -29,11 +34,23 @@ import {
   XIcon,
   useLiveQuery,
   useT,
+  type AutocompleteOption,
   type ContactOption,
   type SegmentedOption,
   type ServiceContextProps,
 } from '@holistic/ui';
-import type { Grant, JoinPolicy, Level, MembersResp, OnlineResp, PolicyResp, ServerView } from './types';
+import type {
+  Grant,
+  JoinPolicy,
+  Level,
+  McProfile,
+  MembersResp,
+  OnlinePlayer,
+  OnlineResp,
+  Player,
+  PolicyResp,
+  ServerView,
+} from './types';
 import { faceUrl } from './face';
 
 interface PickedGroup {
@@ -54,13 +71,63 @@ export function Players({
   const onlineQ = useLiveQuery<OnlineResp>(() => api.get<OnlineResp>(`servers/${srv.id}/players/online`), 8000, [srv.id]);
   const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Which online players are mid-admission, so each row spins on its own instead of the whole panel.
+  const [admitting, setAdmitting] = useState<string[]>([]);
 
   const policy: JoinPolicy = q.data?.policy ?? srv.joinPolicy;
   const grants = q.data?.grants ?? [];
   const players = q.data?.players ?? [];
   const online = onlineQ.data?.online ?? [];
-  // Members currently online, keyed by their holistic username, so a member row can show a live dot.
+  // Who is online, by both keys the console can give us: the holistic username where the name belongs
+  // to a linked account, and the in-game name — which is all a directly-admitted account ever has.
   const onlineUsers = new Set(online.map((o) => o.user).filter(Boolean));
+  const onlineNames = new Set(online.map((o) => o.name));
+  const isOnline = (p: Player) => (p.user && onlineUsers.has(p.user)) || (!!p.name && onlineNames.has(p.name));
+
+  // Everyone the player list already covers, under either name they might be known by. On an open
+  // server the two sets come apart: anyone may be connected without being on the list at all.
+  const covered = new Set<string>();
+  for (const p of players) {
+    if (p.name) covered.add(p.name.toLowerCase());
+    if (p.user) covered.add(p.user.toLowerCase());
+  }
+  const isCovered = (o: OnlinePlayer) =>
+    covered.has(o.name.toLowerCase()) || (!!o.user && covered.has(o.user.toLowerCase()));
+
+  // A connected player's face. A member is fetched by username; someone admitted by name has a UUID
+  // on the player list, which is the only place their identity is known — the console gives names.
+  const uuidByName = new Map(
+    players.filter((p) => p.name && p.uuid).map((p) => [p.name!.toLowerCase(), p.uuid!] as const),
+  );
+  function onlineFace(o: OnlinePlayer): string | undefined {
+    if (o.user) return faceUrl(api, o.user, 56);
+    const uuid = uuidByName.get(o.name.toLowerCase());
+    return uuid ? faceUrl(api, uuid, 56) : undefined;
+  }
+
+  // Put a connected player on the list, so switching to whitelist does not lock them out.
+  //
+  // It goes through the same grant the dialog creates — the daemon resolves the in-game name against
+  // Mojang and stores the UUID. There is no shortcut from "is connected" to "may join": being on the
+  // server is not itself permission to be, which is the whole point of doing this before the switch.
+  async function admitOnline(o: OnlinePlayer) {
+    setAdmitting((a) => [...a, o.name]);
+    try {
+      await api.post(`servers/${srv.id}/members`, {
+        kind: 'minecraft',
+        ref: '',
+        label: o.name,
+        level: 'play',
+        members: [],
+      });
+      ui.toast({ title: t('hosuto.memberAdded'), variant: 'success' });
+      q.refresh();
+    } catch (e) {
+      ui.toast({ title: t('hosuto.addFailed'), description: (e as Error).message, variant: 'error' });
+    } finally {
+      setAdmitting((a) => a.filter((n) => n !== o.name));
+    }
+  }
 
   const policyOptions: SegmentedOption<JoinPolicy>[] = [
     { value: 'whitelist', label: t('hosuto.policyWhitelist') },
@@ -120,10 +187,22 @@ export function Players({
         ) : (
           <Stack gap={2}>
             {online.map((o) => (
-              <Stack key={o.name} direction="row" align="center" gap={2}>
-                <Box className="h-2 w-2 shrink-0 rounded-full bg-success" />
-                <Avatar name={o.name} src={o.user ? faceUrl(api, o.user, 56) : undefined} size={28} />
-                <Text>{o.name}</Text>
+              <Stack key={o.name} direction="row" align="center" justify="between" gap={2}>
+                <Stack direction="row" align="center" gap={2}>
+                  <Box className="h-2 w-2 shrink-0 rounded-full bg-success" />
+                  <Avatar name={o.name} src={onlineFace(o)} size={28} />
+                  <Text>{o.name}</Text>
+                </Stack>
+                {/* Only for someone the list does not cover yet — on a whitelisted server that is
+                    nobody, so the affordance appears exactly where it can still change something. */}
+                {!isCovered(o) &&
+                  (admitting.includes(o.name) ? (
+                    <Spinner className="h-4 w-4" />
+                  ) : (
+                    <IconButton label={t('hosuto.admit')} variant="ghost" onClick={() => void admitOnline(o)}>
+                      <PlusIcon />
+                    </IconButton>
+                  ))}
               </Stack>
             ))}
           </Stack>
@@ -167,11 +246,13 @@ export function Players({
         ) : (
           <Stack gap={2}>
             {players.map((p) => (
-              <Stack key={p.user} direction="row" align="center" justify="between" gap={2}>
+              <Stack key={p.uuid || p.user} direction="row" align="center" justify="between" gap={2}>
                 <Stack direction="row" align="center" gap={2}>
+                  {/* A member's face is fetched by username so their UUID stays out of the URL; an
+                      account admitted directly has no username, and its UUID is what names it. */}
                   <Avatar
                     name={p.name || p.user}
-                    src={p.hasAccount ? faceUrl(api, p.user, 56) : undefined}
+                    src={p.hasAccount ? faceUrl(api, p.user || p.uuid!, 56) : undefined}
                     size={28}
                   />
                   <Stack gap={0}>
@@ -184,7 +265,7 @@ export function Players({
                   </Stack>
                 </Stack>
                 <Stack direction="row" align="center" gap={2}>
-                  {onlineUsers.has(p.user) && (
+                  {isOnline(p) && (
                     <Stack direction="row" align="center" gap={1}>
                       <Box className="h-2 w-2 shrink-0 rounded-full bg-success" />
                       <Text variant="caption" color="secondary">
@@ -229,6 +310,7 @@ function AddMembersModal({
   const t = useT();
   const [people, setPeople] = useState<ContactOption[]>([]);
   const [groups, setGroups] = useState<PickedGroup[]>([]);
+  const [mcName, setMcName] = useState('');
   const [level, setLevel] = useState<Level>('play');
   const [busy, setBusy] = useState(false);
 
@@ -274,6 +356,29 @@ function AddMembersModal({
     return [];
   }, []);
 
+  // Suggestions are accounts already admitted on this owner's servers plus, for a name nothing here
+  // knows, Mojang's answer for that exact name — Mojang has no prefix search to offer beyond it. The
+  // daemon decides which of the two can answer; see searchMinecraft there.
+  //
+  // Each row carries the player's face so the owner SEES who they are admitting. It is fetched by
+  // UUID, which the daemon permits for an account it just resolved.
+  const searchMinecraft = useCallback(
+    async (query: string): Promise<AutocompleteOption[]> => {
+      try {
+        const r = await api.get<{ matches: McProfile[] }>(`minecraft/search?name=${encodeURIComponent(query)}`);
+        return r.matches.map((p) => ({
+          id: p.uuid,
+          label: p.name,
+          avatarUrl: faceUrl(api, p.uuid, 56),
+          data: p,
+        }));
+      } catch {
+        return []; // nothing resolved, or Mojang unreachable — either way there is nobody to offer
+      }
+    },
+    [api],
+  );
+
   const levelOptions: SegmentedOption<Level>[] = [
     { value: 'play', label: t('hosuto.level.play') },
     { value: 'op', label: t('hosuto.level.op') },
@@ -291,7 +396,8 @@ function AddMembersModal({
       });
       return;
     }
-    if (people.length === 0 && groups.length === 0) {
+    const mc = mcName.trim();
+    if (people.length === 0 && groups.length === 0 && mc === '') {
       ui.toast({ title: t('hosuto.nobodyPicked'), variant: 'error' });
       return;
     }
@@ -312,6 +418,19 @@ function AddMembersModal({
           kind: 'contax',
           ref: g.id,
           label: g.name,
+          level,
+          members: [],
+        });
+      }
+      if (mc !== '') {
+        // The typed name is sent, not the one the dropdown resolved: the daemon resolves it to a
+        // UUID itself and refuses a name Mojang does not know, so a name the owner typed without
+        // waiting for the suggestion still works — and a stale suggestion can never be what is
+        // stored. The picker is a convenience here, exactly as the contact picker is above.
+        await api.post(`servers/${serverId}/members`, {
+          kind: 'minecraft',
+          ref: '',
+          label: mc,
           level,
           members: [],
         });
@@ -374,6 +493,22 @@ function AddMembersModal({
             ))}
           </Stack>
         )}
+
+        {/* Someone with no account here. They get to join and nothing more — until they link this
+            same Minecraft account to a holistic account, at which point this grant starts covering
+            the person too, with nothing to add here a second time. */}
+        <Field label={t('hosuto.minecraftName')}>
+          <Autocomplete
+            value={mcName}
+            onChange={setMcName}
+            onSearch={searchMinecraft}
+            onSelect={(o) => setMcName(o.label)}
+            placeholder={t('hosuto.pickMinecraft')}
+            debounceMs={500}
+            minChars={3}
+            emptyText={t('hosuto.noSuchMinecraftAccount')}
+          />
+        </Field>
 
         <Field label={t('hosuto.level')}>
           <Stack direction="row">

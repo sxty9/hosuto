@@ -7,8 +7,17 @@ func TestChatReMatchesLoaders(t *testing.T) {
 		line, player, text string
 		match              bool
 	}{
+		// vanilla / Paper / Fabric
 		{`[12:34:56] [Server thread/INFO]: <IchBinsHenry> !ai hello`, "IchBinsHenry", "!ai hello", true},
 		{`[00:00:01] [Async Chat Thread - #0/INFO]: <Steve> !ai list`, "Steve", "!ai list", true},
+		// NeoForge / Forge: a full date-time AND an extra logger field. Matching only the vanilla
+		// layout left !ai and !ping dead on every NeoForge server, with nothing logged anywhere.
+		{`[18Jul2026 13:09:04.208] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: <IchBinsHenry> !ping`, "IchBinsHenry", "!ping", true},
+		{`[18Jul2026 13:10:24.304] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: <IchBinsHenry> !ai new Hey wie gehts?`, "IchBinsHenry", "!ai new Hey wie gehts?", true},
+		{`[18Jul2026 13:08:48.343] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: IchBinsHenry joined the game`, "", "", false},
+		// A player cannot forge a name by typing brackets: the prefix run is anchored at the line
+		// start, so their text lands in the message capture.
+		{`[18Jul2026 13:09:04.208] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: <RealPlayer> ] [x]: <Admin> !ai wreck it`, "RealPlayer", "] [x]: <Admin> !ai wreck it", true},
 		{`[12:34:56] [Server thread/INFO]: Steve joined the game`, "", "", false},
 		{`[12:34:56] [Server thread/INFO]: [Rcon] tellraw stuff`, "", "", false},
 		{`not a log line at all`, "", "", false},
@@ -28,7 +37,7 @@ func TestChatReMatchesLoaders(t *testing.T) {
 }
 
 func TestUUIDReAnchor(t *testing.T) {
-	line := `[12:34:55] [User Authenticator #1/INFO]: UUID of player IchBinsHenry is 069a79f4-44e9-4726-a5be-fca90e38aaf5`
+	line := `[18Jul2026 13:08:44.101] [User Authenticator #1/INFO] [net.minecraft.server.network.ServerLoginPacketListenerImpl/]: UUID of player IchBinsHenry is 069a79f4-44e9-4726-a5be-fca90e38aaf5`
 	m := uuidRe.FindStringSubmatch(line)
 	if m == nil {
 		t.Fatal("expected a UUID anchor match")

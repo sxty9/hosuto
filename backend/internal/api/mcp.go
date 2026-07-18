@@ -252,16 +252,18 @@ func (s *Server) mcp() *mcp.Registry {
 	})
 
 	reg.Register(mcp.Tool{
-		Name:        "whitelist_add",
-		Description: "Add a member to a server's whitelist by their holistic username. Only works for someone you are acquainted with (a shared contact group) who has linked a Minecraft account — the same rule the dashboard enforces. Owner or admin.",
+		Name: "whitelist_add",
+		Description: "Let someone join a server. Give `user` for a member of this holistic instance — only works for someone you are acquainted with (a shared contact group) who has linked a Minecraft account. " +
+			"Give `minecraft` to admit a Minecraft account by its in-game name, for someone who has no account here at all; they get to join and nothing else. Exactly one of the two. Owner or admin.",
 		InputSchema: schema(map[string]any{
-			"server": serverProp,
-			"user":   map[string]any{"type": "string", "description": "The holistic (Linux) username to add."},
-			"level":  map[string]any{"type": "string", "enum": []string{"play", "op"}, "description": "play (default) or op (may start/stop the server)."},
-		}, "user"),
+			"server":    serverProp,
+			"user":      map[string]any{"type": "string", "description": "The holistic (Linux) username to add."},
+			"minecraft": map[string]any{"type": "string", "description": "An in-game Minecraft name, for someone with no holistic account."},
+			"level":     map[string]any{"type": "string", "enum": []string{"play", "op"}, "description": "play (default) or op (may start/stop the server)."},
+		}),
 		Handler: func(ctx context.Context, cAny any, args json.RawMessage) (any, error) {
 			var a struct {
-				Server, User, Level string
+				Server, User, Level, Minecraft string
 			}
 			decodeArgs(args, &a)
 			c := cAny.(*mcpCaller)
@@ -269,8 +271,11 @@ func (s *Server) mcp() *mcp.Registry {
 			if err != nil {
 				return nil, err
 			}
-			if strings.TrimSpace(a.User) == "" {
-				return nil, errors.New("which member? give a holistic username")
+			user, mc := strings.TrimSpace(a.User), strings.TrimSpace(a.Minecraft)
+			// Naming both is ambiguous about WHO is being added, and naming neither says nothing at
+			// all. Refusing beats guessing: the wrong guess writes an access rule.
+			if (user == "") == (mc == "") {
+				return nil, errors.New("name exactly one of: user (a holistic username) or minecraft (an in-game name)")
 			}
 			level := a.Level
 			if level == "" {
@@ -279,12 +284,18 @@ func (s *Server) mcp() *mcp.Registry {
 			if !store.ValidLevel(level) {
 				return nil, errors.New("level must be play or op")
 			}
-			if err := s.canAdd(c.user.Username, a.User, c.user.Can(rights.GroupAdmin)); err != nil {
+
+			grant := store.Grant{Kind: "adhoc", Level: level, Members: []string{user}, Label: user}
+			who := user
+			if mc != "" {
+				if grant, err = s.admitMinecraft(ctx, srv, mc, level); err != nil {
+					return nil, err
+				}
+				who = grant.Label
+			} else if err := s.canAdd(c.user.Username, user, c.user.Can(rights.GroupAdmin)); err != nil {
 				return nil, err
 			}
-			if _, err := s.st.AddGrant(srv.ID, store.Grant{
-				Kind: "adhoc", Level: level, Members: []string{a.User}, Label: a.User,
-			}); err != nil {
+			if _, err := s.st.AddGrant(srv.ID, grant); err != nil {
 				return nil, err
 			}
 			fresh, _ := s.st.Server(srv.ID)
@@ -292,16 +303,16 @@ func (s *Server) mcp() *mcp.Registry {
 				return nil, err
 			}
 			s.notifyAdded(ctx, fresh, c.user.Username)
-			return "added " + a.User + " (" + level + ")", nil
+			return "added " + who + " (" + level + ")", nil
 		},
 	})
 
 	reg.Register(mcp.Tool{
 		Name:        "whitelist_remove",
-		Description: "Remove a member you added to a server. Cannot remove someone who is on via a contact or system group. Owner or admin.",
+		Description: "Take someone off a server, by holistic username or by in-game Minecraft name — whichever way they were added. Cannot remove someone who is on via a contact or system group. Owner or admin.",
 		InputSchema: schema(map[string]any{
 			"server": serverProp,
-			"user":   map[string]any{"type": "string", "description": "The holistic (Linux) username to remove."},
+			"user":   map[string]any{"type": "string", "description": "A holistic (Linux) username, or an in-game Minecraft name."},
 		}, "user"),
 		Handler: func(ctx context.Context, cAny any, args json.RawMessage) (any, error) {
 			var a struct{ Server, User string }

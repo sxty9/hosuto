@@ -156,12 +156,32 @@ func free(port int) bool {
 // It is written to be safely re-runnable: a half-created server (say, the jar download died) can be
 // created again without hand-cleanup.
 func (m *Manager) Create(ctx context.Context, srv store.Server) (store.Server, error) {
-	dir := Dir(srv.Owner, srv.Slug)
+	if err := m.Prepare(ctx, srv); err != nil {
+		return srv, err
+	}
+	return m.Provision(ctx, srv, true)
+}
 
+// Prepare makes only the tree and the unit drop-in — the privileged half of a create.
+//
+// It is split out because a server that is being MIGRATED or built from a template needs foreign
+// files laid into the tree before the jar is installed on top: the loader's installer writes into
+// libraries/, and server.properties has to be merged over whatever the old host shipped rather than
+// written before it arrives and then clobbered. Create is Prepare + Provision with nothing in
+// between, so the ordinary path has no second implementation to drift from.
+func (m *Manager) Prepare(ctx context.Context, srv store.Server) error {
 	if err := run(ctx, "create", srv.Owner, srv.Slug,
 		strconv.Itoa(srv.HeapMB), strconv.Itoa(srv.Port), strconv.Itoa(srv.RconPort)); err != nil {
-		return srv, fmt.Errorf("create server tree: %w", err)
+		return fmt.Errorf("create server tree: %w", err)
 	}
+	return nil
+}
+
+// Provision installs the loader into an existing tree, writes the files hosuto owns and registers the
+// route. seedLists puts the owner on the whitelist; a migration passes false, because its member list
+// is rebuilt from the grants the import derived and seeding first would be overwritten anyway.
+func (m *Manager) Provision(ctx context.Context, srv store.Server, seedLists bool) (store.Server, error) {
+	dir := Dir(srv.Owner, srv.Slug)
 
 	// Install the jar/loader. This is the slow part (a download plus, for NeoForge, an installer run).
 	//
@@ -187,11 +207,13 @@ func (m *Manager) Create(ctx context.Context, srv store.Server) (store.Server, e
 	}
 	// Seed the owner into the whitelist. From JE 26.3 white-list defaults to true, so a server whose
 	// whitelist is empty would lock out even the person who just created it.
-	if acc, ok := m.st.Account(srv.Owner); ok {
-		_ = mcfiles.WriteWhitelist(filepath.Join(dir, "whitelist.json"),
-			[]mcfiles.Entry{{UUID: acc.UUID, Name: acc.Name}})
-		_ = mcfiles.WriteOps(filepath.Join(dir, "ops.json"),
-			[]mcfiles.Op{{UUID: acc.UUID, Name: acc.Name, Level: 4}})
+	if seedLists {
+		if acc, ok := m.st.Account(srv.Owner); ok {
+			_ = mcfiles.WriteWhitelist(filepath.Join(dir, "whitelist.json"),
+				[]mcfiles.Entry{{UUID: acc.UUID, Name: acc.Name}})
+			_ = mcfiles.WriteOps(filepath.Join(dir, "ops.json"),
+				[]mcfiles.Op{{UUID: acc.UUID, Name: acc.Name, Level: 4}})
+		}
 	}
 
 	if err := m.Route(ctx, srv); err != nil {

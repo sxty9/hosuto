@@ -20,9 +20,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"hosuto/internal/access"
@@ -35,6 +35,7 @@ import (
 	"hosuto/internal/export"
 	"hosuto/internal/files"
 	"hosuto/internal/hconfig"
+	"hosuto/internal/jobs"
 	"hosuto/internal/mcapi"
 	"hosuto/internal/mcfiles"
 	"hosuto/internal/mcp"
@@ -73,23 +74,36 @@ type Server struct {
 	hub   *chathub.Hub
 	acc   *access.Resolver
 	ai    *aigentic.Client
+	seen  *seenUUIDs
 	http  *http.Client
+	// jobs tracks the work that outlives its request — a migration moves gigabytes, which no HTTP
+	// round trip should be asked to hold open. dataDir is where hosuto keeps its own files (template
+	// payloads, staged uploads), beside the state file rather than under the servers root.
+	jobs    *jobs.Registry
+	dataDir string
 }
 
 // New wires the HTTP layer.
 func New(v *auth.Verifier, st *store.Store, cfg *hconfig.Config, rt *runtime.Manager,
 	dir *directory.Directory, cx *contax.Client, nt *notify.Client, mc *mcapi.Client,
 	mr *modrinth.Client, vc *versions.Client, sk *skin.Renderer, tok *mcp.TokenStore,
-	chats *chatstore.Store, hub *chathub.Hub, acc *access.Resolver, ai *aigentic.Client) *Server {
+	chats *chatstore.Store, hub *chathub.Hub, acc *access.Resolver, ai *aigentic.Client,
+	jobsReg *jobs.Registry, dataDir string) *Server {
 	return &Server{v: v, st: st, cfg: cfg, rt: rt, dir: dir, cx: cx, nt: nt, mc: mc, mr: mr, vc: vc,
 		skin: sk, tok: tok, pair: pairing.New(pairingTTL), chats: chats, hub: hub, acc: acc, ai: ai,
-		http: &http.Client{Timeout: 60 * time.Second}}
+		seen: newSeenUUIDs(searchFaceTTL),
+		http: &http.Client{Timeout: 60 * time.Second}, jobs: jobsReg, dataDir: dataDir}
 }
 
 // pairingTTL is how long a desktop pairing code stays claimable. Long enough to walk from the browser
 // to the app, short enough that a code read over someone's shoulder is worthless by the time it is
 // tried. It takes no config: a knob here would only ever be turned the wrong way.
 const pairingTTL = 5 * time.Minute
+
+// searchFaceTTL is how long a searched-but-not-yet-admitted account stays renderable. It only has to
+// outlive the owner reading the dropdown and deciding; once they admit the account, the grant itself
+// makes the face renderable and this no longer matters.
+const searchFaceTTL = 15 * time.Minute
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
 
@@ -108,12 +122,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT "+base+"account", s.guard(rights.GroupPlay, true, s.linkAccount))
 	mux.HandleFunc("DELETE "+base+"account", s.guard(rights.GroupPlay, true, s.unlinkAccount))
 
+	// Finding a game account by name, without linking or granting anything. Both flows that need one
+	// — linking your own, admitting someone else's — ask here first, so neither has to guess whether
+	// the name exists before it acts on it.
+	mux.HandleFunc("GET "+base+"minecraft/search", s.guard(rights.GroupPlay, false, s.searchMinecraft))
+
 	// A member's face, rendered from their Minecraft skin. hosuto owns the account mapping, so hosuto
 	// is the only service that can serve this.
 	mux.HandleFunc("GET "+base+"avatar/{user}", s.guard(rights.GroupPlay, false, s.avatar))
 
 	mux.HandleFunc("GET "+base+"servers", s.guard(rights.GroupPlay, false, s.listServers))
 	mux.HandleFunc("POST "+base+"servers", s.guard(rights.GroupHost, true, s.createServer))
+	// Migration: the same act as a create, but it moves gigabytes off an upload or a foreign host, so
+	// it answers with a job to watch instead of holding the request open for minutes. See migrate.go.
+	mux.HandleFunc("POST "+base+"servers/import", s.guard(rights.GroupHost, true, s.importServer))
 	mux.HandleFunc("GET "+base+"servers/{id}", s.guard(rights.GroupPlay, false, s.getServer))
 	mux.HandleFunc("DELETE "+base+"servers/{id}", s.guard(rights.GroupHost, true, s.deleteServer))
 
@@ -149,6 +171,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+base+"servers/{id}/mods", s.guard(rights.GroupHost, true, s.addMod))
 	mux.HandleFunc("DELETE "+base+"servers/{id}/mods/{modId}", s.guard(rights.GroupHost, true, s.removeMod))
 	mux.HandleFunc("PUT "+base+"servers/{id}/version", s.guard(rights.GroupHost, true, s.setVersion))
+
+	// Templates: a server saved as a recipe, and instantiated back into a new one. Owned like a
+	// server (creator + admin), because a payload carries the source server's config files.
+	mux.HandleFunc("GET "+base+"templates", s.guard(rights.GroupHost, false, s.listTemplates))
+	mux.HandleFunc("POST "+base+"templates", s.guard(rights.GroupHost, true, s.createTemplate))
+	mux.HandleFunc("DELETE "+base+"templates/{tid}", s.guard(rights.GroupHost, true, s.deleteTemplate))
+
+	// Background work (a migration, packing a template). The UI polls these.
+	mux.HandleFunc("GET "+base+"jobs", s.guard(rights.GroupHost, false, s.listJobs))
+	mux.HandleFunc("GET "+base+"jobs/{jid}", s.guard(rights.GroupHost, false, s.job))
+	mux.HandleFunc("DELETE "+base+"jobs/{jid}", s.guard(rights.GroupHost, true, s.cancelJob))
 
 	mux.HandleFunc("GET "+base+"catalog/versions", s.guard(rights.GroupPlay, false, s.catalogVersions))
 	mux.HandleFunc("GET "+base+"catalog/loaders", s.guard(rights.GroupPlay, false, s.catalogLoaders))
@@ -312,6 +345,90 @@ func (s *Server) linkAccount(w http.ResponseWriter, r *http.Request, u *auth.Use
 	writeJSON(w, http.StatusOK, a)
 }
 
+// searchMinecraft finds game accounts by name, from the two sources that can answer.
+//
+// Mojang has NO name-search: its API answers an exact name and nothing else — there is no prefix or
+// fuzzy endpoint to call, at any price. So a search box over "all Minecraft accounts" cannot exist,
+// and pretending otherwise would mean scraping a third-party site, which is both an availability
+// dependency and someone else's data.
+//
+// What can be answered honestly is the union of:
+//
+//	LOCAL  — accounts this owner has admitted before, matched by prefix. Instant, free, and the
+//	         common case: the same friends get added to one server after another.
+//	MOJANG — the exact name, if the query names an account not already known here. This is the
+//	         only way to reach somebody entirely new.
+//
+// The Mojang half is rate-limited for the whole host (~200 requests per two minutes, shared), so it
+// is skipped whenever a local match already answers the query exactly, mcapi refuses an impossible
+// name without spending a request, and the UI only asks once the user stops typing.
+func (s *Server) searchMinecraft(w http.ResponseWriter, r *http.Request, u *auth.User) {
+	q := strings.TrimSpace(r.URL.Query().Get("name"))
+	if q == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"matches": []mcapi.Profile{}})
+		return
+	}
+
+	matches := []mcapi.Profile{}
+	seen := map[string]bool{}
+	exact := false
+	for _, p := range s.knownAccounts(u, q) {
+		matches = append(matches, p)
+		seen[strings.ToLower(p.UUID)] = true
+		exact = exact || strings.EqualFold(p.Name, q)
+	}
+
+	// Only spend Mojang's budget on a name nothing here already answers.
+	if !exact {
+		if p, err := s.mc.Lookup(r.Context(), q); err == nil && !seen[strings.ToLower(p.UUID)] {
+			matches = append(matches, p)
+		}
+	}
+	// A face is fetched by UUID for an account nobody has been admitted under yet, so the renderer
+	// has to accept these until the owner decides. See seenUUIDs.
+	for _, p := range matches {
+		s.seen.mark(p.UUID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"matches": matches})
+}
+
+// maxSuggestions bounds the local half of a search. A dropdown is a shortlist; past a handful the
+// owner is better served by typing the name out.
+const maxSuggestions = 8
+
+// knownAccounts is the local half of searchMinecraft: Minecraft accounts already admitted on the
+// caller's own servers, whose name starts with the query.
+//
+// It suggests only what the caller put there themselves (an admin sees all, as everywhere). Linked
+// MEMBERS are deliberately absent: they are added through the contact picker, which enforces contax
+// visibility, and offering them here too would both duplicate that path and leak who else exists.
+func (s *Server) knownAccounts(u *auth.User, q string) []mcapi.Profile {
+	prefix := strings.ToLower(q)
+	isAdmin := u.Can(rights.GroupAdmin)
+	var out []mcapi.Profile
+	seen := map[string]bool{}
+	for _, srv := range s.st.Servers() {
+		if srv.Owner != u.Username && !isAdmin {
+			continue
+		}
+		for _, g := range srv.Grants {
+			if g.Kind != "minecraft" || !strings.HasPrefix(strings.ToLower(g.Label), prefix) {
+				continue
+			}
+			key := strings.ToLower(g.Ref)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, mcapi.Profile{UUID: g.Ref, Name: g.Label})
+			if len(out) == maxSuggestions {
+				return out
+			}
+		}
+	}
+	return out
+}
+
 func (s *Server) unlinkAccount(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	if err := s.st.UnlinkAccount(u.Username); err != nil {
 		writeErr(w, http.StatusNotFound, "No linked account")
@@ -334,23 +451,82 @@ func (s *Server) resyncFor(ctx context.Context, user string) {
 	}
 }
 
-// avatar serves a member's Minecraft face as a PNG.
+// seenUUIDs remembers accounts this daemon resolved for a search, so their face can be rendered
+// while the owner is still deciding whether to admit them.
 //
-// The path carries a Linux username, not a UUID: the UUID is hosuto's to know, and putting it in a
-// URL the browser holds would leak every member's Mojang identity into logs and history for no gain.
+// It is what keeps the face route from being an open Mojang proxy without making the search useless:
+// a UUID gets in only by coming back from a lookup an authenticated caller already paid for, and it
+// ages out shortly after, so the set stays small and cannot be grown into a general permit.
+type seenUUIDs struct {
+	mu  sync.Mutex
+	at  map[string]time.Time
+	ttl time.Duration
+	now func() time.Time
+}
+
+func newSeenUUIDs(ttl time.Duration) *seenUUIDs {
+	return &seenUUIDs{at: map[string]time.Time{}, ttl: ttl, now: time.Now}
+}
+
+// mark records a UUID as freshly resolved, dropping any that have aged out. Pruning on write keeps
+// the map bounded by what one search burst can produce, with no goroutine to own.
+func (s *seenUUIDs) mark(uuid string) {
+	key := strings.ToLower(strings.TrimSpace(uuid))
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	for k, t := range s.at {
+		if now.Sub(t) > s.ttl {
+			delete(s.at, k)
+		}
+	}
+	s.at[key] = now
+}
+
+func (s *seenUUIDs) has(uuid string) bool {
+	key := strings.ToLower(strings.TrimSpace(uuid))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.at[key]
+	return ok && s.now().Sub(t) <= s.ttl
+}
+
+// avatar serves a player's Minecraft face as a PNG.
 //
-// A member with no linked account, or one whose profile has no skin, gets a 404 — and the SDK's
-// <Avatar> falls back to their initials on an image error. That fallback is the honest outcome: a
-// made-up Steve face would claim a skin they do not have.
+// For a MEMBER the path carries their Linux username, never their UUID: the UUID is hosuto's to
+// know, and putting it in a URL the browser holds would leak every member's Mojang identity into
+// logs and history for no gain.
+//
+// A directly-admitted Minecraft account has no username to carry, so for those the path carries the
+// dashed UUID — which gives nothing away, because it is the identity the owner typed in to admit
+// them and belongs to no member here. The two cannot be confused: the account lookup runs first, so
+// a real member always wins, and only the strict 8-4-4-4-12 form is read as a UUID.
+//
+// A member with no linked account, or a profile with no skin, gets a 404 — and the SDK's <Avatar>
+// falls back to their initials on an image error. That fallback is the honest outcome: a made-up
+// Steve face would claim a skin they do not have.
 func (s *Server) avatar(w http.ResponseWriter, r *http.Request, _ *auth.User) {
-	user := strings.TrimSuffix(r.PathValue("user"), ".png")
-	acc, ok := s.st.Account(user)
-	if !ok {
+	ref := strings.TrimSuffix(r.PathValue("user"), ".png")
+	uuid := ""
+	if acc, ok := s.st.Account(ref); ok {
+		uuid = acc.UUID
+	} else if len(ref) == 36 {
+		// Only a UUID this landscape actually plays with, or one it just resolved for a search, or
+		// the route would render faces for any UUID a member cares to name — on a Mojang budget the
+		// whole host shares.
+		if u, err := mcapi.Dash(ref); err == nil && (s.acc.AdmittedUUID(u) || s.seen.has(u)) {
+			uuid = u
+		}
+	}
+	if uuid == "" {
 		writeErr(w, http.StatusNotFound, "No linked account")
 		return
 	}
 	size, _ := strconv.Atoi(r.URL.Query().Get("size"))
-	png, err := s.skin.Face(r.Context(), acc.UUID, size)
+	png, err := s.skin.Face(r.Context(), uuid, size)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "No skin")
 		return
@@ -411,6 +587,10 @@ func redact(srv store.Server) store.Server {
 	return srv
 }
 
+// createServer makes a server either blank or from a template. The third way in — migrating one from
+// an archive or a foreign host — is importServer in migrate.go, which answers with a job because it
+// moves gigabytes; everything the three share (slug rules, the quota, ports, the record) lives in
+// reserve() so the rules that protect the host cannot drift between them.
 func (s *Server) createServer(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	var body struct {
 		Name          string `json:"name"`
@@ -419,78 +599,69 @@ func (s *Server) createServer(w http.ResponseWriter, r *http.Request, u *auth.Us
 		Loader        string `json:"loader"`
 		LoaderVersion string `json:"loaderVersion"`
 		HeapMB        int    `json:"heapMB"`
+		TemplateID    string `json:"templateId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "Malformed request")
 		return
 	}
-	body.Slug = strings.ToLower(strings.TrimSpace(body.Slug))
-	if !store.SlugRe.MatchString(body.Slug) {
-		writeErr(w, http.StatusBadRequest, "The address may use lowercase letters, digits and dashes")
-		return
-	}
-	if !store.ValidLoader(body.Loader) {
-		writeErr(w, http.StatusBadRequest, "Unknown loader")
-		return
-	}
-	if body.MCVersion == "" {
-		writeErr(w, http.StatusBadRequest, "Pick a Minecraft version")
-		return
-	}
-	// The slug is a public DNS label, so it is globally unique, not per-user.
-	if s.st.SlugTaken(body.Slug) {
-		writeErr(w, http.StatusConflict, "That address is already taken")
-		return
-	}
-	if err := s.supported(r.Context(), body.Loader, body.MCVersion); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	// The per-user cap is not a nicety: each server is gigabytes of heap on a box that also runs the
-	// rest of the landscape. devlab caps previews for exactly this reason.
-	max := s.cfg.Int("maxServersPerUser", 3)
-	if !u.Can(rights.GroupAdmin) && s.st.CountOwnedBy(u.Username) >= max {
-		writeErr(w, http.StatusForbidden,
-			fmt.Sprintf("You already have %d servers — remove one first", max))
-		return
+
+	// A template already carries the version, the loader and the heap, so the form does not ask for
+	// them again and they are not validated here — they were validated when the source server was
+	// made, and the payload on disk was built for exactly that pair.
+	var tpl store.Template
+	fromTpl := strings.TrimSpace(body.TemplateID) != ""
+	if fromTpl {
+		t, ok := s.visibleTemplate(body.TemplateID, u)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "No such template")
+			return
+		}
+		if _, err := os.Stat(s.templatePath(t.ID)); err != nil {
+			writeErr(w, http.StatusConflict, "That template's files are missing")
+			return
+		}
+		tpl = t
+		if body.HeapMB <= 0 {
+			body.HeapMB = t.HeapMB
+		}
+	} else {
+		if !store.ValidLoader(body.Loader) {
+			writeErr(w, http.StatusBadRequest, "Unknown loader")
+			return
+		}
+		if body.MCVersion == "" {
+			writeErr(w, http.StatusBadRequest, "Pick a Minecraft version")
+			return
+		}
+		if err := s.supported(r.Context(), body.Loader, body.MCVersion); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
-	heap := body.HeapMB
-	if heap <= 0 {
-		heap = s.cfg.Int("defaultHeapMB", 2048)
-	}
-	if lim := s.cfg.Int("maxHeapMB", 4096); heap > lim {
-		heap = lim
-	}
-	port, rconPort, err := s.rt.AllocatePorts()
-	if err != nil {
-		writeErr(w, http.StatusServiceUnavailable, "No free port — the server pool is full")
-		return
-	}
-	pass, err := mcfiles.GenRconPassword()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not generate a control password")
-		return
-	}
-	name := strings.TrimSpace(body.Name)
-	if name == "" {
-		name = body.Slug
-	}
-
-	srv := store.Server{
-		Slug: body.Slug, Name: name, Owner: u.Username,
+	// A template supplies the version/loader/heap it was built for; a blank create takes them from
+	// the form. Either way they are settled BEFORE the record is registered — the store validates the
+	// loader on insert, so a record cannot be completed after the fact.
+	proto := store.Server{
+		Name: body.Name, Slug: body.Slug, HeapMB: body.HeapMB,
 		MCVersion: body.MCVersion, Loader: body.Loader, LoaderVersion: body.LoaderVersion,
-		HeapMB: heap, Port: port, RconPort: rconPort, RconPass: pass,
-		Host: s.rt.Host(body.Slug), JoinPolicy: "whitelist",
 	}
-	// Record it first: a failure part-way through Create then leaves a row the user can retry or
-	// delete, rather than an orphaned directory nobody knows about.
-	srv, err = s.st.CreateServer(srv)
+	if fromTpl {
+		proto.MCVersion, proto.Loader, proto.LoaderVersion = tpl.MCVersion, tpl.Loader, tpl.LoaderVersion
+	}
+	srv, code, err := s.reserve(u, proto)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not create the server")
+		writeErr(w, code, err.Error())
 		return
 	}
-	if srv, err = s.rt.Create(r.Context(), srv); err != nil {
+
+	if fromTpl {
+		srv, err = s.fromTemplate(r.Context(), srv, tpl)
+	} else {
+		srv, err = s.rt.Create(r.Context(), srv)
+	}
+	if err != nil {
 		_ = s.st.DeleteServer(srv.ID)
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -972,6 +1143,52 @@ func (s *Server) canAdd(actor, target string, actorIsAdmin bool) error {
 	return nil
 }
 
+// Why admitting a game account can fail. They are sentinels rather than strings because the HTTP
+// surface has to turn them back into status codes, and the MCP surface must not have to.
+var (
+	errMcUnknown     = errors.New("no Minecraft account with that name")
+	errMcUnreachable = errors.New("could not reach the Minecraft account service")
+	errMcAlreadyOn   = errors.New("already on this server")
+)
+
+// admitMinecraft resolves an in-game name into the grant that would admit it, WITHOUT saving it.
+//
+// It is the one place a bare game account becomes a player, shared by the dashboard and the MCP
+// tool: what a name resolves to, and when admitting it is refused, is one rule and must not be
+// written twice. Saving is left to the caller, because the dashboard adds this grant through the
+// same path as every other kind.
+//
+// The name is resolved to a UUID once, here, and the UUID is what gets stored: it survives a Mojang
+// rename, and it is the key whitelist.json is actually read by. The label keeps Mojang's spelling
+// so the player list reads the way the player writes their own name.
+func (s *Server) admitMinecraft(ctx context.Context, srv store.Server, name, level string) (store.Grant, error) {
+	p, err := s.mc.Lookup(ctx, strings.TrimSpace(name))
+	if errors.Is(err, mcapi.ErrNoSuchPlayer) {
+		return store.Grant{}, errMcUnknown
+	}
+	if err != nil {
+		return store.Grant{}, errMcUnreachable
+	}
+	for _, g := range srv.Grants {
+		if g.Kind == "minecraft" && strings.EqualFold(g.Ref, p.UUID) {
+			return store.Grant{}, fmt.Errorf("%s is %w", p.Name, errMcAlreadyOn)
+		}
+	}
+	return store.Grant{Kind: "minecraft", Ref: p.UUID, Label: p.Name, Level: level}, nil
+}
+
+// admitStatus maps an admission failure to the status the browser should see.
+func admitStatus(err error) int {
+	switch {
+	case errors.Is(err, errMcUnknown):
+		return http.StatusNotFound
+	case errors.Is(err, errMcAlreadyOn):
+		return http.StatusConflict
+	default:
+		return http.StatusBadGateway
+	}
+}
+
 type playerView struct {
 	User       string `json:"user"`
 	Name       string `json:"name,omitempty"`
@@ -987,17 +1204,15 @@ func (s *Server) listMembers(w http.ResponseWriter, r *http.Request, u *auth.Use
 		return
 	}
 	players := []playerView{}
-	add := func(user, level string) {
-		acc, has := s.st.Account(user)
+	for _, p := range s.acc.Players(r.Context(), srv) {
 		players = append(players, playerView{
-			User: user, Name: acc.Name, UUID: acc.UUID, Level: level, HasAccount: has,
+			User: p.User, Name: p.Name, UUID: p.UUID, Level: p.Level,
+			// "has an account to write to the whitelist", which is what the UI warns about. A
+			// directly-admitted Minecraft account is nothing but such an account, so it is never
+			// the thing being warned about even though no holistic user stands behind it.
+			HasAccount: p.UUID != "",
 		})
 	}
-	add(srv.Owner, "op")
-	for user, level := range s.resolve(r.Context(), srv) {
-		add(user, level)
-	}
-	sort.Slice(players, func(i, j int) bool { return players[i].User < players[j].User })
 	grants := srv.Grants
 	if grants == nil {
 		grants = []store.Grant{}
@@ -1067,6 +1282,17 @@ func (s *Server) addMembers(w http.ResponseWriter, r *http.Request, u *auth.User
 			writeErr(w, http.StatusForbidden, "Only an administrator may add a system group")
 			return
 		}
+	case "minecraft":
+		// Admitting a bare game account is the owner's call alone — and this handler already ran
+		// s.owned(), so no further check belongs here. It deliberately skips canAdd: that gate asks
+		// whether two MEMBERS of this landscape are acquainted, and there is no member on the other
+		// side of this grant to be acquainted with.
+		g, err := s.admitMinecraft(r.Context(), srv, body.Label, body.Level)
+		if err != nil {
+			writeErr(w, admitStatus(err), err.Error())
+			return
+		}
+		body.Ref, body.Label, body.Members = g.Ref, g.Label, nil
 	}
 
 	g, err := s.st.AddGrant(srv.ID, store.Grant{
@@ -1111,19 +1337,14 @@ func (s *Server) removeMember(w http.ResponseWriter, r *http.Request, u *auth.Us
 func (s *Server) applyMembers(ctx context.Context, srv store.Server) error {
 	var entries []mcfiles.Entry
 	var ops []mcfiles.Op
-	add := func(user, level string) {
-		acc, ok := s.st.Account(user)
-		if !ok {
-			return
+	for _, p := range s.acc.Players(ctx, srv) {
+		if p.UUID == "" {
+			continue
 		}
-		entries = append(entries, mcfiles.Entry{UUID: acc.UUID, Name: acc.Name})
-		if level == "op" {
-			ops = append(ops, mcfiles.Op{UUID: acc.UUID, Name: acc.Name, Level: 4})
+		entries = append(entries, mcfiles.Entry{UUID: p.UUID, Name: p.Name})
+		if p.Level == "op" {
+			ops = append(ops, mcfiles.Op{UUID: p.UUID, Name: p.Name, Level: 4})
 		}
-	}
-	add(srv.Owner, "op")
-	for user, level := range s.resolve(ctx, srv) {
-		add(user, level)
 	}
 	return s.rt.ApplyWhitelist(ctx, srv, entries, ops)
 }
@@ -1244,11 +1465,18 @@ func (s *Server) removeMod(w http.ResponseWriter, r *http.Request, u *auth.User)
 
 // setVersion changes the Minecraft version and/or the loader.
 //
-// The mod set is NOT silently carried over. A mod jar is built for one (version, loader) pair, and
-// leaving an incompatible jar in mods/ is the most common way to get a server that dies on boot with
-// an unreadable stack trace. Every Modrinth mod is re-resolved against the new pair; the ones with
-// no matching build are removed AND reported back, so the user learns what they lost instead of
-// discovering it from a crash.
+// The mod set is NOT silently carried over ACROSS A PAIR CHANGE. A mod jar is built for one
+// (Minecraft version, loader) pair, and leaving an incompatible jar in mods/ is the most common way
+// to get a server that dies on boot with an unreadable stack trace. So when that pair changes, every
+// Modrinth mod is re-resolved against the new one; the ones with no matching build are removed AND
+// reported back, so the user learns what they lost instead of discovering it from a crash.
+//
+// Changing only the loader BUILD is a different thing and must not touch the mods. A jar is not built
+// against NeoForge 21.1.236 as opposed to 21.1.240 — it is built against Minecraft 1.21.1 on NeoForge,
+// and both builds run it. Re-resolving anyway would quietly upgrade every mod to whatever is newest
+// today, which is actively harmful in the case that matters most: a server migrated from another host,
+// whose players' clients are already synced to the exact versions it came with. They would be locked
+// out by a version mismatch they never asked for.
 func (s *Server) setVersion(w http.ResponseWriter, r *http.Request, u *auth.User) {
 	srv, ok := s.owned(r, u)
 	if !ok {
@@ -1286,10 +1514,14 @@ func (s *Server) setVersion(w http.ResponseWriter, r *http.Request, u *auth.User
 		return
 	}
 
+	// The pair is what a mod jar is built against. If it did not change, the installed jars are still
+	// exactly right and are left alone — see the note on this function.
+	pairChanged := body.MCVersion != srv.MCVersion || body.Loader != srv.Loader
+
 	kept := []store.Mod{}
 	dropped := []string{}
 	for _, m := range srv.Mods {
-		if m.Source != "modrinth" {
+		if !pairChanged || m.Source != "modrinth" {
 			kept = append(kept, m) // an uploaded jar is the user's business; we cannot re-resolve it
 			continue
 		}
@@ -1315,8 +1547,9 @@ func (s *Server) setVersion(w http.ResponseWriter, r *http.Request, u *auth.User
 	// thing that knows which one that turned out to be.
 	srv.MCVersion, srv.Loader, srv.LoaderVersion = body.MCVersion, body.Loader, resolvedLoader
 	srv.Mods = kept
-	// Every jar under mods/ was just replaced, and exec.argv now names a different Minecraft. A live
-	// server is running none of it until it is bounced — no exceptions worth carving out here.
+	// exec.argv now names a different loader build (and possibly a different Minecraft), and on a pair
+	// change every jar under mods/ was replaced too. Either way a live server is running none of it
+	// until it is bounced — no exceptions worth carving out here.
 	srv.RestartRequired = true
 	if err := s.st.UpdateServer(srv); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the version")

@@ -28,6 +28,7 @@ import (
 	"hosuto/internal/directory"
 	"hosuto/internal/hconfig"
 	"hosuto/internal/ingame"
+	"hosuto/internal/jobs"
 	"hosuto/internal/mcapi"
 	"hosuto/internal/mcp"
 	"hosuto/internal/modrinth"
@@ -156,8 +157,14 @@ func main() {
 	igCtx, igCancel := context.WithCancel(context.Background())
 	go eng.Run(igCtx)
 
+	// Migrations and template packing outlive the request that starts them, so they are tracked here
+	// rather than held open on a connection. In-memory on purpose: a job is only interesting while it
+	// runs, and a daemon restart ends the work anyway.
+	jobsReg := jobs.New()
+
 	srv := &http.Server{
-		Handler:           api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk, tok, chats, hub, acc, ai).Handler(),
+		Handler: api.New(v, st, cfg, mgr, dir, cx, nt, mc, mr, vc, sk, tok, chats, hub, acc, ai,
+			jobsReg, filepath.Dir(*statePath)).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	// Bind synchronously so "address already in use" surfaces here, not inside a goroutine.

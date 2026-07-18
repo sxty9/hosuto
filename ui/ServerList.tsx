@@ -3,7 +3,7 @@
 // Minecraft-account link, so "Bob added you" can become a whitelist entry without anyone typing a
 // UUID. It is also where the account itself gets linked, because without it a member cannot be
 // whitelisted anywhere and every other surface here is useless to them.
-import { useCallback, useEffect, useState } from 'react';
+import { useState } from 'react';
 import {
   Avatar,
   Badge,
@@ -11,13 +11,9 @@ import {
   Button,
   ContextMenu,
   EmptyState,
-  Field,
-  Autocomplete,
   Input,
-  Modal,
   Panel,
   PlusIcon,
-  SegmentedControl,
   ServerIcon,
   Spinner,
   Stack,
@@ -27,37 +23,24 @@ import {
   useLiveQuery,
   useT,
   userHasRight,
-  type AutocompleteOption,
   type MenuItem,
-  type SegmentedOption,
   type ServiceContextProps,
   type TranslateFn,
 } from '@holistic/ui';
 import { PairDeviceModal } from './PairDevice';
-import {
-  LOADERS,
-  type Account,
-  type CatalogLoadersResp,
-  type CatalogVersionsResp,
-  type Info,
-  type Loader,
-  type RunState,
-  type ServerView,
-  type ServersResp,
-} from './types';
+import { CreateServerModal, SaveTemplateModal } from './CreateServer';
+import { type Account, type RunState, type ServerView, type ServersResp } from './types';
 import { faceUrl } from './face';
 
 const HOST = 'hp_hosuto_host';
 const PLAY = 'hp_hosuto_play';
 const ADMIN = 'hp_hosuto_admin';
 
-// Mirrors store.SlugRe. The slug is a public DNS label, so the rule is the daemon's, not ours —
-// checking it here only saves a round trip, it never decides anything.
-const SLUG_RE = /^[a-z][a-z0-9-]{1,31}$/;
-
 const DOT: Record<RunState, string> = {
   active: 'bg-success',
   activating: 'bg-warning',
+  deactivating: 'bg-warning',
+  reloading: 'bg-warning',
   inactive: 'bg-fill/40',
   failed: 'bg-danger',
 };
@@ -116,6 +99,7 @@ export function ServerList({ onOpen, ...props }: ListProps) {
                   t={t}
                   canControl
                   canDelete={canHost}
+                  canTemplate={canHost}
                   onOpen={onOpen}
                   onChanged={q.refresh}
                 />
@@ -144,6 +128,9 @@ export function ServerList({ onOpen, ...props }: ListProps) {
                   // an admin may drive anything. Deleting stays with the owner (and admins).
                   canControl={srv.level === 'op' || canAdmin}
                   canDelete={canAdmin && canHost}
+                  // A template carries the source server's config files, so making one is an
+                  // owner-or-admin act — the same gate the daemon applies.
+                  canTemplate={canAdmin && canHost}
                   onOpen={onOpen}
                   onChanged={q.refresh}
                 />
@@ -263,6 +250,7 @@ function ServerRow({
   t,
   canControl,
   canDelete,
+  canTemplate,
   onOpen,
   onChanged,
 }: Pick<ServiceContextProps, 'api' | 'ui'> & {
@@ -270,10 +258,12 @@ function ServerRow({
   t: TranslateFn;
   canControl: boolean;
   canDelete: boolean;
+  canTemplate: boolean;
   onOpen: (id: string) => void;
   onChanged: () => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [templating, setTemplating] = useState(false);
   const state: RunState = srv.status?.state ?? 'inactive';
   const online = srv.status?.online ?? 0;
   const max = srv.status?.max ?? 0;
@@ -319,6 +309,16 @@ function ServerRow({
     items.push({ id: 'stop', label: t('hosuto.stop'), disabled: busy || !running, onSelect: () => void act('stop') });
     items.push({ id: 'restart', label: t('hosuto.restart'), disabled: busy || !running, onSelect: () => void act('restart') });
   }
+  // Saving a template lives on the server itself — a template is made FROM a server, so the act
+  // belongs where the server is, not behind a separate "templates" screen nobody would find.
+  if (canTemplate) {
+    items.push({
+      id: 'template',
+      label: t('hosuto.tpl.save'),
+      separatorBefore: true,
+      onSelect: () => setTemplating(true),
+    });
+  }
   if (canDelete) {
     items.push({
       id: 'delete',
@@ -332,244 +332,47 @@ function ServerRow({
   }
 
   return (
-    <ContextMenu items={items}>
-      <Box>
-        <Panel interactive className="cursor-pointer p-3" onClick={() => onOpen(srv.id)}>
-          <Stack direction="row" align="center" justify="between" gap={3} wrap>
-            <Stack direction="row" align="center" gap={3}>
-              <Box className={cn('h-2.5 w-2.5 shrink-0 rounded-full', DOT[state])} />
-              <Stack gap={0}>
-                <Text weight="semibold">{srv.name}</Text>
-                <Text variant="caption" color="tertiary">
-                  {srv.host}
-                </Text>
+    <>
+      {templating && (
+        <SaveTemplateModal api={api} ui={ui} srv={srv} onClose={() => setTemplating(false)} />
+      )}
+      <ContextMenu items={items}>
+        <Box>
+          <Panel interactive className="cursor-pointer p-3" onClick={() => onOpen(srv.id)}>
+            <Stack direction="row" align="center" justify="between" gap={3} wrap>
+              <Stack direction="row" align="center" gap={3}>
+                <Box className={cn('h-2.5 w-2.5 shrink-0 rounded-full', DOT[state])} />
+                <Stack gap={0}>
+                  <Text weight="semibold">{srv.name}</Text>
+                  <Text variant="caption" color="tertiary">
+                    {srv.host}
+                  </Text>
+                </Stack>
+                {state === 'active' && (
+                  <Badge variant={online > 0 ? 'success' : 'neutral'}>
+                    {online}/{max}
+                  </Badge>
+                )}
               </Stack>
-              {state === 'active' && (
-                <Badge variant={online > 0 ? 'success' : 'neutral'}>
-                  {online}/{max}
-                </Badge>
+
+              {canControl && (
+                // stopPropagation: these buttons act on the row, they do not open it.
+                <Stack direction="row" align="center" gap={1} onClick={(e) => e.stopPropagation()}>
+                  <Button variant="ghost" size="sm" disabled={busy || running} onClick={() => void act('start')}>
+                    {t('hosuto.start')}
+                  </Button>
+                  <Button variant="ghost" size="sm" disabled={busy || !running} onClick={() => void act('stop')}>
+                    {t('hosuto.stop')}
+                  </Button>
+                  <Button variant="ghost" size="sm" disabled={busy || !running} onClick={() => void act('restart')}>
+                    {t('hosuto.restart')}
+                  </Button>
+                </Stack>
               )}
             </Stack>
-
-            {canControl && (
-              // stopPropagation: these buttons act on the row, they do not open it.
-              <Stack direction="row" align="center" gap={1} onClick={(e) => e.stopPropagation()}>
-                <Button variant="ghost" size="sm" disabled={busy || running} onClick={() => void act('start')}>
-                  {t('hosuto.start')}
-                </Button>
-                <Button variant="ghost" size="sm" disabled={busy || !running} onClick={() => void act('stop')}>
-                  {t('hosuto.stop')}
-                </Button>
-                <Button variant="ghost" size="sm" disabled={busy || !running} onClick={() => void act('restart')}>
-                  {t('hosuto.restart')}
-                </Button>
-              </Stack>
-            )}
-          </Stack>
-        </Panel>
-      </Box>
-    </ContextMenu>
-  );
-}
-
-// ── create ────────────────────────────────────────────────────────────────────────────
-
-function CreateServerModal({
-  api,
-  ui,
-  onClose,
-  onCreated,
-}: Pick<ServiceContextProps, 'api' | 'ui'> & { onClose: () => void; onCreated: (id: string) => void }) {
-  const t = useT();
-  const [name, setName] = useState('');
-  const [slug, setSlug] = useState('');
-  const [mcVersion, setMcVersion] = useState('');
-  const [loader, setLoader] = useState<Loader>('fabric');
-  const [loaderVersion, setLoaderVersion] = useState('');
-  const [heap, setHeap] = useState('2048');
-  const [busy, setBusy] = useState(false);
-
-  const [zone, setZone] = useState('');
-  const [releases, setReleases] = useState<string[]>([]);
-  const [loaderVersions, setLoaderVersions] = useState<string[]>([]);
-  const [loadersLoading, setLoadersLoading] = useState(false);
-
-  // The catalogue is the daemon's, not ours: versions come from Mojang's manifest and loader
-  // builds from each loader's own index, both proxied and cached by the backend.
-  useEffect(() => {
-    api.get<Info>('info').then((i) => setZone(i.zone)).catch(() => setZone(''));
-    api
-      .get<CatalogVersionsResp>('catalog/versions')
-      .then((r) => setReleases((r.versions ?? []).filter((v) => v.type === 'release').map((v) => v.id)))
-      .catch(() => setReleases([]));
-  }, [api]);
-
-  const latest = releases[0] ?? '';
-  const mc = mcVersion.trim() || latest;
-
-  // Pre-fill the newest release once the catalogue loads, so the field shows the value that will
-  // actually be used instead of a gray hint the user has to trust is adopted. Only an untouched
-  // field is filled — once they type, their choice stands.
-  useEffect(() => {
-    if (!mcVersion && releases.length > 0) setMcVersion(releases[0]);
-  }, [releases, mcVersion]);
-
-  useEffect(() => {
-    if (loader === 'vanilla' || !mc) {
-      setLoaderVersions([]);
-      setLoadersLoading(false);
-      return;
-    }
-    let live = true;
-    setLoadersLoading(true);
-    api
-      .get<CatalogLoadersResp>(`catalog/loaders?loader=${encodeURIComponent(loader)}&mcVersion=${encodeURIComponent(mc)}`)
-      .then((r) => live && setLoaderVersions(r.versions ?? []))
-      .catch(() => live && setLoaderVersions([]))
-      .finally(() => live && setLoadersLoading(false));
-    return () => {
-      live = false;
-    };
-  }, [api, loader, mc]);
-
-  // Same pre-fill for the loader build. The list reloads on every loader/version change (and the
-  // loader switch clears the field, below), so this re-fills the newest build for each combination —
-  // and the value shown is the value sent.
-  useEffect(() => {
-    if (loader !== 'vanilla' && !loaderVersion && loaderVersions.length > 0) {
-      setLoaderVersion(loaderVersions[0]);
-    }
-  }, [loaderVersions, loader, loaderVersion]);
-
-  // Mod loaders lag weeks behind a Minecraft release, so "newest Minecraft + NeoForge" — the most
-  // natural thing to pick, and what this form defaults to — often has no builds at all. Say so at the
-  // field instead of letting the user press Create and collect a failure. The daemon refuses the same
-  // combination anyway; this only saves them the round trip.
-  const unsupported = loader !== 'vanilla' && !!mc && !loadersLoading && loaderVersions.length === 0;
-
-  const searchVersions = useCallback(
-    async (q: string): Promise<AutocompleteOption[]> =>
-      releases.filter((v) => v.includes(q)).slice(0, 40).map((v) => ({ id: v, label: v })),
-    [releases],
-  );
-  const searchLoaderVersions = useCallback(
-    async (q: string): Promise<AutocompleteOption[]> =>
-      loaderVersions.filter((v) => v.includes(q)).slice(0, 40).map((v) => ({ id: v, label: v })),
-    [loaderVersions],
-  );
-
-  const slugBad = slug.length > 0 && !SLUG_RE.test(slug);
-
-  async function create() {
-    if (!slug || slugBad) {
-      ui.toast({ title: t('hosuto.slugRule'), variant: 'error' });
-      return;
-    }
-    if (!mc) {
-      ui.toast({ title: t('hosuto.pickVersion'), variant: 'error' });
-      return;
-    }
-    setBusy(true);
-    try {
-      const srv = await api.post<ServerView>('servers', {
-        name: name.trim() || slug,
-        slug,
-        mcVersion: mc,
-        loader,
-        loaderVersion: loaderVersion.trim(), // empty: the daemon takes the newest build
-        heapMB: Number(heap) || 0,
-      });
-      ui.toast({ title: t('hosuto.created'), variant: 'success' });
-      onCreated(srv.id);
-      onClose();
-    } catch (e) {
-      ui.toast({ title: t('hosuto.createFailed'), description: (e as Error).message, variant: 'error' });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const loaderOptions: SegmentedOption<Loader>[] = LOADERS.map((l) => ({ value: l, label: l }));
-
-  return (
-    <Modal
-      open
-      onOpenChange={(o) => !o && onClose()}
-      title={t('hosuto.createTitle')}
-      size="md"
-      footer={
-        <Stack direction="row" justify="end" gap={2}>
-          <Button variant="ghost" onClick={onClose} disabled={busy}>
-            {t('hosuto.cancel')}
-          </Button>
-          <Button variant="primary" onClick={create} loading={busy} disabled={unsupported}>
-            {t('hosuto.create')}
-          </Button>
-        </Stack>
-      }
-    >
-      <Stack gap={4}>
-        <Field label={t('hosuto.name')}>
-          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder={slug || t('hosuto.namePlaceholder')} autoFocus />
-        </Field>
-
-        <Field
-          label={t('hosuto.address')}
-          error={slugBad ? t('hosuto.slugRule') : undefined}
-          hint={!slugBad && slug && zone ? `${slug}.${zone}` : undefined}
-        >
-          <Input
-            value={slug}
-            onChange={(e) => setSlug(e.target.value.toLowerCase())}
-            placeholder={t('hosuto.slugPlaceholder')}
-            invalid={slugBad}
-          />
-        </Field>
-
-        <Field label={t('hosuto.mcVersion')}>
-          <Autocomplete
-            value={mcVersion}
-            onChange={setMcVersion}
-            onSearch={searchVersions}
-            onSelect={(o) => setMcVersion(o.label)}
-            placeholder={latest || t('hosuto.loading')}
-            minChars={1}
-          />
-        </Field>
-
-        <Field label={t('hosuto.loader')}>
-          <Stack direction="row">
-            <SegmentedControl
-              value={loader}
-              onChange={(v) => {
-                setLoader(v);
-                setLoaderVersion('');
-              }}
-              options={loaderOptions}
-            />
-          </Stack>
-        </Field>
-
-        {loader !== 'vanilla' && (
-          <Field
-            label={t('hosuto.loaderVersion')}
-            error={unsupported ? t('hosuto.loaderUnsupported', { loader, mc }) : undefined}
-          >
-            <Autocomplete
-              value={loaderVersion}
-              onChange={setLoaderVersion}
-              onSearch={searchLoaderVersions}
-              onSelect={(o) => setLoaderVersion(o.label)}
-              placeholder={loaderVersions[0] ?? t('hosuto.latest')}
-              minChars={1}
-            />
-          </Field>
-        )}
-
-        <Field label={t('hosuto.memory')}>
-          <Input type="number" min={512} step={512} value={heap} onChange={(e) => setHeap(e.target.value)} />
-        </Field>
-      </Stack>
-    </Modal>
+          </Panel>
+        </Box>
+      </ContextMenu>
+    </>
   );
 }

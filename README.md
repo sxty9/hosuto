@@ -31,6 +31,28 @@ Membership itself is never copied. A grant points at a contax group or an OS gro
 are resolved **live** on every request — contax owns its groups, the OS owns its groups, hosuto owns
 only the pointer.
 
+## Creating a server
+
+One door, three sources — they are the same act, so they share one form and one set of rules
+(`api.reserve`): slug, quota, ports, record.
+
+- **New** — blank, on a chosen Minecraft version and loader.
+- **Template** — a recipe saved off any server you own. It carries the version, loader, mods and
+  config; `server.properties` is packed sanitised, so a template never carries the source server's
+  rcon password. The world comes along only if the creator ticked *include the world*.
+- **Migrate** — a server from somewhere else, as a ZIP upload or pulled over FTP (GPortal, Nitrado
+  and friends). It moves gigabytes, so it answers with a job the UI polls rather than holding the
+  request open.
+
+A migration does not just move files. `detect` reads the tree it landed and hosuto commits what it
+says, so **every** tab comes out right: the loader and Minecraft version (`level.dat` wins — it is
+what actually wrote the world), the heap the old host gave it, the join policy, the whitelist and
+ops, and the mods — hashed and identified against Modrinth, so a jar called `mod (1).jar` still shows
+up as *Jade*. What it cannot establish it leaves empty and says so; it never guesses a Minecraft
+version, because installing the wrong one over a world is the one mistake a migration must not make
+on its own. Players are carried across only where somebody on this instance has linked that
+Minecraft account — the rest are named in the report, not dropped in silence.
+
 ## Tabs
 
 Servers first (**Meine Server** / **Beitretbare Server** — the latter is what others added you to);
@@ -103,8 +125,12 @@ systemd/hosuto-mc@.service   the per-server template unit
 permissions/hosuto.json   rights manifest (privleg)
 config/hosuto.json        config manifest (the central Configuration tab)
 backend/internal/
-  store/     accounts + servers + grants (flat JSON, atomic, daemon is sole writer)
+  store/     accounts + servers + grants + templates (flat JSON, atomic, daemon is sole writer)
   runtime/   ports, systemd, mc-router route, whitelist, live status
+  archive/   zip in/out — zip-slip proof, symlinks refused, bounded (migration + templates)
+  detect/    reads a foreign server tree and works out what it is (loader, version, mods, players)
+  ftp/       a small FTP client, stdlib only — pulls a server off GPortal/Nitrado and the like
+  jobs/      progress for work that outlives its request (a migration moves gigabytes)
   mcnet/     RCON + Server List Ping, hand-rolled (zero deps)
   mcfiles/   server.properties, whitelist.json, ops.json, eula.txt
   versions/  Mojang / Fabric / NeoForge / Paper — catalogue and install

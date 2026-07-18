@@ -8,6 +8,7 @@ package access
 
 import (
 	"context"
+	"sort"
 	"strings"
 
 	"hosuto/internal/auth"
@@ -74,9 +75,103 @@ func (r *Resolver) Resolve(ctx context.Context, srv store.Server) map[string]str
 			for _, m := range r.dir.GroupMembers(g.Ref) {
 				set(m, g.Level)
 			}
+		case "minecraft":
+			// A game account admitted directly usually has nobody here behind it, and then it
+			// contributes no Linux user — it may join, it may not see the dashboard.
+			//
+			// But the mapping is looked up live, so the day that player links the same account to a
+			// holistic user, this grant starts resolving to them: their access "upgrades" from
+			// join-only to full membership without anyone editing the server. That is why the lookup
+			// belongs here rather than being frozen into the grant when it is created.
+			if user, ok := r.UserByUUID(g.Ref); ok {
+				set(user, g.Level)
+			}
 		}
 	}
 	return out
+}
+
+// Player is one entry of a server's player list: a game identity, the level it may join at, and the
+// Linux user behind it — empty for a Minecraft account admitted directly.
+//
+// UUID is empty when a member has not linked an account: they are a player on paper with nothing to
+// write to the whitelist yet, and both callers need to tell that apart from having no player at all.
+type Player struct {
+	User  string
+	UUID  string
+	Name  string
+	Level string
+}
+
+// Players is the whole player list of a server, in one pass: resolved members through their linked
+// accounts, plus the Minecraft accounts admitted directly.
+//
+// It exists because there are exactly two things to do with that list — show it and write it to
+// whitelist.json — and doing them from two separate expansions of the same grants is how the file
+// and the screen come to disagree. Both callers read this.
+//
+// A player reachable more than once appears once: "op" wins over "play", and a directly-admitted
+// account that has since been linked merges with its holistic member rather than showing twice.
+func (r *Resolver) Players(ctx context.Context, srv store.Server) []Player {
+	byKey := map[string]*Player{}
+	var order []string
+
+	// UUID is the identity; a member with no account yet can only be keyed by their username.
+	add := func(p Player) {
+		key := normUUID(p.UUID)
+		if key == "" {
+			if p.User == "" {
+				return
+			}
+			key = "user:" + p.User
+		}
+		cur, seen := byKey[key]
+		if !seen {
+			cp := p
+			byKey[key] = &cp
+			order = append(order, key)
+			return
+		}
+		if p.Level == "op" {
+			cur.Level = "op"
+		}
+		if cur.User == "" {
+			cur.User = p.User
+		}
+		if cur.Name == "" {
+			cur.Name = p.Name
+		}
+	}
+	addUser := func(user, level string) {
+		acc, _ := r.st.Account(user) // a member with no linked account still lists, without a UUID
+		add(Player{User: user, UUID: acc.UUID, Name: acc.Name, Level: level})
+	}
+
+	addUser(srv.Owner, "op") // the owner is implicitly op and never appears in Resolve
+	for user, level := range r.Resolve(ctx, srv) {
+		addUser(user, level)
+	}
+	for _, g := range srv.Grants {
+		if g.Kind == "minecraft" {
+			add(Player{UUID: g.Ref, Name: g.Label, Level: g.Level})
+		}
+	}
+
+	out := make([]Player, 0, len(order))
+	for _, k := range order {
+		out = append(out, *byKey[k])
+	}
+	sort.Slice(out, func(i, j int) bool { return playerLabel(out[i]) < playerLabel(out[j]) })
+	return out
+}
+
+// playerLabel is what a player is called on screen, and therefore what they sort by: their in-game
+// name, or their username while they have no account to take a name from.
+func playerLabel(p Player) string {
+	if p.Name != "" {
+		return strings.ToLower(p.Name)
+	}
+	return strings.ToLower(p.User)
 }
 
 // HasAccess is the one authorisation rule. Membership is resolved live (never copied).
@@ -119,6 +214,31 @@ func (r *Resolver) UserByUUID(uuid string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// AdmittedUUID reports whether a Minecraft account is one this landscape has anything to do with:
+// linked by a member, or admitted directly on some server.
+//
+// It exists to keep the face renderer from becoming an open proxy. A face is fetched by UUID for a
+// directly-admitted account (there is no username to fetch it by), and without this any member could
+// spend hosuto's shared Mojang session-server budget rendering faces for UUIDs nobody here has ever
+// heard of. hosuto renders the faces of its own players and no others.
+func (r *Resolver) AdmittedUUID(uuid string) bool {
+	want := normUUID(uuid)
+	if want == "" {
+		return false
+	}
+	if _, ok := r.UserByUUID(want); ok {
+		return true
+	}
+	for _, srv := range r.st.Servers() {
+		for _, g := range srv.Grants {
+			if g.Kind == "minecraft" && normUUID(g.Ref) == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // UserByName maps an in-game name back to a Linux user. The name is "at link time" and goes stale on

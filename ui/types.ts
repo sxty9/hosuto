@@ -6,9 +6,13 @@
 export type Loader = 'vanilla' | 'fabric' | 'neoforge' | 'paper';
 export type JoinPolicy = 'whitelist' | 'open';
 export type Level = 'play' | 'op';
-export type GrantKind = 'adhoc' | 'contax' | 'holistic';
+export type GrantKind = 'adhoc' | 'contax' | 'holistic' | 'minecraft';
 export type Env = 'required' | 'optional' | 'unsupported' | 'unknown';
-export type RunState = 'active' | 'inactive' | 'failed' | 'activating';
+// The full vocabulary of `systemctl is-active`, which runtime.State passes through verbatim.
+// deactivating and reloading are easy to forget and neither is rare: stopping a modded server takes
+// a while (hosuto-stop issues an RCON /stop and waits for the world to save), so "deactivating" is on
+// screen for a good few seconds every single time one is shut down.
+export type RunState = 'active' | 'inactive' | 'failed' | 'activating' | 'deactivating' | 'reloading';
 
 export const LOADERS: Loader[] = ['vanilla', 'fabric', 'neoforge', 'paper'];
 
@@ -31,7 +35,7 @@ export interface Account {
 export interface Grant {
   id: string;
   kind: GrantKind;
-  ref: string; // contax: group id · holistic: OS group · adhoc: ""
+  ref: string; // contax: group id · holistic: OS group · minecraft: dashed uuid · adhoc: ""
   label: string;
   level: Level;
   members?: string[]; // adhoc: Linux usernames
@@ -128,12 +132,20 @@ export interface PairStart {
   host: string;
 }
 
+// One entry of a server's player list. `user` is empty for a Minecraft account admitted directly:
+// nobody in this landscape stands behind it yet, and `name`/`uuid` are all there is to show.
 export interface Player {
   user: string;
   name?: string;
   uuid?: string;
   level: Level;
   hasAccount: boolean;
+}
+
+// A Minecraft account as Mojang spells it, resolved from a name the user typed.
+export interface McProfile {
+  uuid: string;
+  name: string;
 }
 
 export interface MembersResp {
@@ -195,6 +207,62 @@ export interface CatalogModsResp {
 }
 
 export type Tab = 'reach' | 'players' | 'modding' | 'files' | 'ai' | 'export';
+
+// ── creating a server ─────────────────────────────────────────────────────────────────
+
+// The three ways a server comes into being. They are one act with three sources, not three
+// features — hence one entry point in the UI and one shared set of rules in the daemon.
+export type CreateMode = 'new' | 'template' | 'migrate';
+// Where a migration reads from: an archive the user uploads, or a foreign host over FTP.
+export type MigrateSource = 'upload' | 'ftp';
+
+// A saved server recipe (store.Template). includeWorld says whether it is a starting point or a
+// clone — the difference between a few megabytes and a few gigabytes, so the UI must show it.
+export interface Template {
+  id: string;
+  name: string;
+  owner: string;
+  game: string;
+  mcVersion: string;
+  loader: Loader;
+  loaderVersion?: string;
+  heapMB: number;
+  joinPolicy: JoinPolicy;
+  mods?: Mod[];
+  includeWorld: boolean;
+  size: number;
+  sourceSlug?: string;
+  created: number;
+}
+
+export interface TemplatesResp {
+  templates: Template[];
+}
+
+export type JobState = 'running' | 'done' | 'failed' | 'canceled';
+
+// Background work that outlives the request that started it (jobs.Job). done/total count bytes or
+// items depending on the phase; total 0 means "not yet known", which the UI renders as an
+// indeterminate bar rather than a bar stuck at zero.
+export interface Job {
+  id: string;
+  kind: 'import' | 'template';
+  owner: string;
+  state: JobState;
+  phase: string;
+  message?: string;
+  done: number;
+  total: number;
+  serverId?: string;
+  notes?: string[];
+  error?: string;
+  started: number;
+  ended?: number;
+}
+
+export interface JobsResp {
+  jobs: Job[];
+}
 
 // One turn in a server's shared "Ask AI" thread. Persisted by hosuto, visible to every operator of
 // the server; a user turn carries the author so the shared log shows who asked.

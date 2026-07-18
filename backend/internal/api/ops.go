@@ -193,9 +193,14 @@ func (s *Server) applyPolicy(ctx context.Context, srv store.Server, policy strin
 	return srv, nil
 }
 
-// revokeUser removes a user from every ad-hoc grant on a server and drops any grant left empty, then
-// re-applies the whitelist. It cannot remove someone who is on the server via a contax or OS group —
-// that membership belongs to the group, not to hosuto — so it reports that rather than doing nothing.
+// revokeUser takes someone off a server: out of every ad-hoc grant naming them, and out of any
+// Minecraft account admitted under that name. Grants left empty are dropped, then the whitelist is
+// re-applied.
+//
+// The target is matched as a holistic username AND as an in-game name, because "take this person
+// off" is one intent and the caller should not have to know which way they got on. It cannot remove
+// someone who is on via a contax or OS group — that membership belongs to the group, not to hosuto
+// — so it reports that rather than doing nothing.
 func (s *Server) revokeUser(ctx context.Context, srv store.Server, target string) error {
 	fresh, ok := s.st.Server(srv.ID)
 	if !ok {
@@ -204,6 +209,10 @@ func (s *Server) revokeUser(ctx context.Context, srv store.Server, target string
 	changed := false
 	var kept []store.Grant
 	for _, g := range fresh.Grants {
+		if g.Kind == "minecraft" && strings.EqualFold(g.Label, target) {
+			changed = true
+			continue
+		}
 		if g.Kind == "adhoc" {
 			var members []string
 			for _, m := range g.Members {

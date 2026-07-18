@@ -14,15 +14,22 @@ import (
 	"hosuto/internal/store"
 )
 
-// The log lines we care about, in the vanilla/Paper/Fabric format
+// The log lines we care about. Two layouts exist and BOTH have to match, because the loader chooses
+// the log4j pattern and the difference is invisible until the feature silently does nothing:
 //
-//	[HH:MM:SS] [<thread>/INFO]: <Name> message text
-//	[HH:MM:SS] [User Authenticator #N/INFO]: UUID of player <Name> is <uuid>
+//	vanilla / Paper / Fabric   [HH:MM:SS] [<thread>/INFO]: <Name> message text
+//	NeoForge / Forge           [ddMMMyyyy HH:MM:SS.SSS] [<thread>/INFO] [<logger>/]: <Name> message
 //
-// The thread tag varies by loader (Server thread, Async Chat Thread - #0, …), so it is matched
-// loosely. Compiled once; a follower reuses them for every line.
+// So the timestamp is not parsed at all — it is simply the first bracketed field — and any number of
+// further bracketed fields may follow before the colon. Pinning the timestamp to HH:MM:SS and to
+// exactly one thread tag is what made `!ai` and `!ping` dead on every NeoForge server: the follower
+// read the lines, matched nothing, and reported no error anywhere.
+//
+// The bracket run is anchored at the start of the line and must be followed by ": <", so it can only
+// ever match the prefix the SERVER wrote. A player who types brackets and angle-brackets into chat
+// lands in the message capture, never in the name.
 var (
-	chatRe = regexp.MustCompile(`^\[\d{2}:\d{2}:\d{2}\] \[[^]]*\]: <([^>]+)> (.*)$`)
+	chatRe = regexp.MustCompile(`^\[[^]]*\](?: \[[^]]*\])*: <([^>]+)> (.*)$`)
 	uuidRe = regexp.MustCompile(`UUID of player (\S+) is ([0-9a-fA-F-]{32,36})`)
 )
 
