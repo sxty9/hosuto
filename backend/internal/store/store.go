@@ -36,6 +36,11 @@ var (
 	ErrExists = errors.New("already exists")
 	// ErrInvalid is returned for a malformed slug, kind or level.
 	ErrInvalid = errors.New("invalid")
+
+	// errUnchanged lets a mutate closure report that it changed nothing, so the shared write path
+	// returns the current record without a disk write. It never leaves the store: it is how a
+	// conditional writer (SetRestartRequired) shares the one atomic path without a spurious save.
+	errUnchanged = errors.New("unchanged")
 )
 
 // SlugRe bounds a server slug. It has to be safe in three namespaces at once, and the shortest of
@@ -149,7 +154,7 @@ func ValidPolicy(p string) bool { return p == "whitelist" || p == "open" }
 func ValidKind(k string) bool {
 	return k == "adhoc" || k == "contax" || k == "holistic" || k == "minecraft"
 }
-func ValidLevel(l string) bool  { return l == "play" || l == "op" }
+func ValidLevel(l string) bool { return l == "play" || l == "op" }
 
 // ModsOnly reports whether this loader runs client-side mods at all. Paper runs Bukkit PLUGINS,
 // which are server-only: there is nothing to hand a Paper player. The UI must say so rather than
@@ -168,7 +173,7 @@ func LoaderHasClientMods(l string) bool { return l == "fabric" || l == "neoforge
 // mod records its project and version, so instantiating a template can restore that provenance
 // instead of degrading every mod to an anonymous jar the Modding tab cannot act on.
 type Template struct {
-	ID            string `json:"id"`   // tpl-xxxxxxxx
+	ID            string `json:"id"` // tpl-xxxxxxxx
 	Name          string `json:"name"`
 	Owner         string `json:"owner"` // Linux username; templates are owned like servers are
 	Game          string `json:"game"`
@@ -181,8 +186,8 @@ type Template struct {
 	// IncludeWorld records what the creator chose. A template without a world starts every server
 	// from a fresh one; a template with it is a clone, and the UI must be able to say which it is
 	// before someone instantiates four gigabytes by accident.
-	IncludeWorld bool  `json:"includeWorld"`
-	Size         int64 `json:"size"` // payload bytes, for the same reason
+	IncludeWorld bool   `json:"includeWorld"`
+	Size         int64  `json:"size"` // payload bytes, for the same reason
 	SourceSlug   string `json:"sourceSlug,omitempty"`
 	Created      int64  `json:"created"`
 }
@@ -273,6 +278,48 @@ func genID(prefix string) string {
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)
 	return prefix + hex.EncodeToString(b)
+}
+
+// mutate is the store's single read-modify-write path over one server. It takes the lock, reads the
+// CURRENT record, applies fn, and persists the result — read, change and write share one critical
+// section, so no concurrent writer can interleave (Atomare Zugriffe). fn must change only the fields
+// it owns and must not call back into the store, which already holds the lock. Returning an error from
+// fn aborts the write and propagates the error; returning errUnchanged aborts the write silently and
+// yields the current record. Every server write in this package goes through here, so the atomicity
+// guarantee holds in exactly one place rather than being re-derived at each call site.
+func (s *Store) mutate(id string, fn func(*Server) error) (Server, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	srv, ok := s.st.Servers[id]
+	if !ok {
+		return Server{}, ErrNotFound
+	}
+	switch err := fn(&srv); err {
+	case nil:
+		// fall through to the write
+	case errUnchanged:
+		return srv, nil // no change, no observable write
+	default:
+		return Server{}, err
+	}
+	srv.Mods = identifyMods(srv.Mods)
+	s.st.Servers[id] = srv
+	if err := s.save(); err != nil {
+		return Server{}, err
+	}
+	return srv, nil
+}
+
+// MutateServer applies fn to a server as one atomic read-modify-write and returns the saved record.
+//
+// This is the correct way to change a LIVE server: fn receives the store's CURRENT record (never a
+// snapshot the caller read earlier and has been holding across other work), so a field a concurrent
+// operation set in the meantime is preserved, not clobbered. Any slow work a change needs — resolving
+// or downloading mods, talking to another service — must run BEFORE the call and be handed in through
+// the closure, because fn runs under the store lock. If fn returns an error nothing is written and the
+// error is returned; ErrNotFound comes back for an unknown id.
+func (s *Store) MutateServer(id string, fn func(*Server) error) (Server, error) {
+	return s.mutate(id, fn)
 }
 
 // ── accounts ──────────────────────────────────────────────────────────────────────────
@@ -417,7 +464,11 @@ func (s *Store) CreateServer(srv Server) (Server, error) {
 	return srv, s.save()
 }
 
-// UpdateServer replaces a server record wholesale. Callers read-modify-write.
+// UpdateServer replaces a server record wholesale from a snapshot the caller owns exclusively. Use it
+// only to FINALIZE a record the caller alone is provisioning — server creation and import — where no
+// other writer holds the id yet, so replacing the whole record cannot lose a concurrent change. For an
+// in-place change to a live server, use MutateServer: a wholesale write of a snapshot read earlier
+// would silently drop a grant, mod or member added in between (the read-modify-write is not atomic).
 func (s *Store) UpdateServer(srv Server) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -448,103 +499,86 @@ func (s *Store) AddGrant(serverID string, g Grant) (Grant, error) {
 	if !ValidKind(g.Kind) || !ValidLevel(g.Level) {
 		return Grant{}, ErrInvalid
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	srv, ok := s.st.Servers[serverID]
-	if !ok {
-		return Grant{}, ErrNotFound
-	}
-	g.ID = genID("grn-")
-	g.Created = time.Now().Unix()
-	srv.Grants = append(srv.Grants, g)
-	s.st.Servers[serverID] = srv
-	return g, s.save()
+	_, err := s.mutate(serverID, func(srv *Server) error {
+		g.ID = genID("grn-")
+		g.Created = time.Now().Unix()
+		srv.Grants = append(srv.Grants, g)
+		return nil
+	})
+	return g, err
 }
 
 // RemoveGrant drops a membership entry.
 func (s *Store) RemoveGrant(serverID, grantID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	srv, ok := s.st.Servers[serverID]
-	if !ok {
-		return ErrNotFound
-	}
-	out := srv.Grants[:0]
-	found := false
-	for _, g := range srv.Grants {
-		if g.ID == grantID {
-			found = true
-			continue
+	_, err := s.mutate(serverID, func(srv *Server) error {
+		out := srv.Grants[:0]
+		found := false
+		for _, g := range srv.Grants {
+			if g.ID == grantID {
+				found = true
+				continue
+			}
+			out = append(out, g)
 		}
-		out = append(out, g)
-	}
-	if !found {
-		return ErrNotFound
-	}
-	srv.Grants = out
-	s.st.Servers[serverID] = srv
-	return s.save()
+		if !found {
+			return ErrNotFound
+		}
+		srv.Grants = out
+		return nil
+	})
+	return err
 }
 
 // ── mods ──────────────────────────────────────────────────────────────────────────────
 
 // AddMod records an installed mod. The caller has already put the jar in the server's mods/ dir.
 func (s *Store) AddMod(serverID string, m Mod) (Mod, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	srv, ok := s.st.Servers[serverID]
-	if !ok {
-		return Mod{}, ErrNotFound
-	}
-	m.ID = genID("mod-")
-	m.Added = time.Now().Unix()
-	srv.Mods = append(srv.Mods, m)
-	s.st.Servers[serverID] = srv
-	return m, s.save()
+	_, err := s.mutate(serverID, func(srv *Server) error {
+		m.ID = genID("mod-")
+		m.Added = time.Now().Unix()
+		srv.Mods = append(srv.Mods, m)
+		return nil
+	})
+	return m, err
 }
 
 // RemoveMod drops a mod record and returns it, so the caller can delete the jar.
 func (s *Store) RemoveMod(serverID, modID string) (Mod, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	srv, ok := s.st.Servers[serverID]
-	if !ok {
-		return Mod{}, ErrNotFound
-	}
 	var removed Mod
-	out := srv.Mods[:0]
-	found := false
-	for _, m := range srv.Mods {
-		if m.ID == modID {
-			removed, found = m, true
-			continue
+	_, err := s.mutate(serverID, func(srv *Server) error {
+		out := srv.Mods[:0]
+		found := false
+		for _, m := range srv.Mods {
+			if m.ID == modID {
+				removed, found = m, true
+				continue
+			}
+			out = append(out, m)
 		}
-		out = append(out, m)
+		if !found {
+			return ErrNotFound
+		}
+		srv.Mods = out
+		return nil
+	})
+	if err != nil {
+		return Mod{}, err
 	}
-	if !found {
-		return Mod{}, ErrNotFound
-	}
-	srv.Mods = out
-	s.st.Servers[serverID] = srv
-	return removed, s.save()
+	return removed, nil
 }
 
 // SetRestartRequired remembers whether the live server has drifted from its record. The store does not
 // decide WHEN that is so — it is a passive pool, and the rule (which changes a running world actually
 // cares about) lives with the operations, in api/ops.go.
 func (s *Store) SetRestartRequired(serverID string, v bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	srv, ok := s.st.Servers[serverID]
-	if !ok {
-		return ErrNotFound
-	}
-	if srv.RestartRequired == v {
-		return nil // no write for a no-op: every Start clears a flag that is usually already clear
-	}
-	srv.RestartRequired = v
-	s.st.Servers[serverID] = srv
-	return s.save()
+	_, err := s.mutate(serverID, func(srv *Server) error {
+		if srv.RestartRequired == v {
+			return errUnchanged // no write for a no-op: every Start clears a flag that is usually already clear
+		}
+		srv.RestartRequired = v
+		return nil
+	})
+	return err
 }
 
 // ── templates ─────────────────────────────────────────────────────────────────────────
@@ -603,15 +637,11 @@ func (s *Store) DeleteTemplate(id string) error {
 // the UI offers addresses a mod by id, so one that shipped without would be listed and then be
 // impossible to remove.
 func (s *Store) SetMods(serverID string, mods []Mod) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	srv, ok := s.st.Servers[serverID]
-	if !ok {
-		return ErrNotFound
-	}
-	srv.Mods = identifyMods(mods)
-	s.st.Servers[serverID] = srv
-	return s.save()
+	_, err := s.mutate(serverID, func(srv *Server) error {
+		srv.Mods = mods // mutate runs identifyMods on the way out
+		return nil
+	})
+	return err
 }
 
 // identifyMods gives every mod an id and a timestamp. It runs on every write path that can carry a

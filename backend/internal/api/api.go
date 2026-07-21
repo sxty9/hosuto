@@ -1543,23 +1543,28 @@ func (s *Server) setVersion(w http.ResponseWriter, r *http.Request, u *auth.User
 		kept = append(kept, m)
 	}
 
+	// The re-resolve above did its network work against a snapshot; the write itself is atomic, so a
+	// grant or member added during those seconds of downloading survives instead of being clobbered.
 	// resolvedLoader, not body.LoaderVersion: an empty request means "newest", and Install is the only
 	// thing that knows which one that turned out to be.
-	srv.MCVersion, srv.Loader, srv.LoaderVersion = body.MCVersion, body.Loader, resolvedLoader
-	srv.Mods = kept
-	// exec.argv now names a different loader build (and possibly a different Minecraft), and on a pair
-	// change every jar under mods/ was replaced too. Either way a live server is running none of it
-	// until it is bounced — no exceptions worth carving out here.
-	srv.RestartRequired = true
-	if err := s.st.UpdateServer(srv); err != nil {
+	fresh, err := s.st.MutateServer(srv.ID, func(cur *store.Server) error {
+		cur.MCVersion, cur.Loader, cur.LoaderVersion = body.MCVersion, body.Loader, resolvedLoader
+		cur.Mods = kept
+		// exec.argv now names a different loader build (and possibly a different Minecraft), and on a pair
+		// change every jar under mods/ was replaced too. Either way a live server is running none of it
+		// until it is bounced — no exceptions worth carving out here.
+		cur.RestartRequired = true
+		return nil
+	})
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the version")
 		return
 	}
-	if err := s.rt.SyncConfig(ctx, srv); err != nil {
+	if err := s.rt.SyncConfig(ctx, fresh); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"server": redact(srv), "dropped": dropped})
+	writeJSON(w, http.StatusOK, map[string]any{"server": redact(fresh), "dropped": dropped})
 }
 
 func (s *Server) catalogVersions(w http.ResponseWriter, r *http.Request, _ *auth.User) {
