@@ -1,8 +1,11 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -179,5 +182,119 @@ func TestTemplatesPersistAndOldStateStillOpens(t *testing.T) {
 	}
 	if _, err := old.CreateTemplate(Template{Name: "New", Owner: "ada", Loader: "fabric"}); err != nil {
 		t.Fatalf("a legacy state file could not take a template: %v", err)
+	}
+}
+
+// ── atomic access (Atomare Zugriffe) ────────────────────────────────────────────────────
+
+// A change to a live server must be an atomic read-modify-write: MutateServer sees the CURRENT record,
+// not a snapshot read earlier, so a field another operation set in between is preserved rather than
+// clobbered. This is the exact bug the whole-record UpdateServer path had — setVersion read a server,
+// spent seconds downloading, then wrote its stale snapshot back over any grant added meanwhile.
+func TestMutateServerPreservesConcurrentChange(t *testing.T) {
+	s := open(t)
+	srv := newServer(t, s)
+
+	// The snapshot a slow operation (e.g. setVersion) is holding while it does its network work.
+	stale := srv
+
+	// A concurrent operation adds a member while that work is in flight.
+	if _, err := s.AddGrant(srv.ID, Grant{Kind: "adhoc", Level: "play", Label: "ada", Members: []string{"ada"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The slow operation now commits its version change — atomically, so the grant is NOT lost.
+	got, err := s.MutateServer(srv.ID, func(cur *Server) error {
+		cur.MCVersion, cur.Loader = "1.21.4", "fabric"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Grants) != 1 {
+		t.Fatalf("atomic mutate lost the concurrently added grant: %+v", got.Grants)
+	}
+	if got.MCVersion != "1.21.4" {
+		t.Fatalf("version change did not take: %+v", got)
+	}
+
+	// Guard the contrast: the old wholesale write of the stale snapshot WOULD have dropped the grant,
+	// which is why the live-server paths must not use it.
+	stale.MCVersion = "1.21.4"
+	if err := s.UpdateServer(stale); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded, _ := s.Server(srv.ID); len(reloaded.Grants) != 0 {
+		t.Fatalf("expected the wholesale write to clobber the grant (documents why MutateServer exists), got %+v", reloaded.Grants)
+	}
+}
+
+func TestMutateServerNotFound(t *testing.T) {
+	s := open(t)
+	called := false
+	_, err := s.MutateServer("srv-nope", func(*Server) error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+	if called {
+		t.Fatal("fn ran for an unknown server")
+	}
+}
+
+// A closure that fails leaves the store untouched: no partial write, no observable intermediate state.
+func TestMutateServerFnErrorAbortsWrite(t *testing.T) {
+	s := open(t)
+	srv := newServer(t, s)
+	boom := errors.New("boom")
+	_, err := s.MutateServer(srv.ID, func(cur *Server) error {
+		cur.Name = "Changed"
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("got %v, want boom", err)
+	}
+	if got, _ := s.Server(srv.ID); got.Name != "Test" {
+		t.Fatalf("a failed mutation still wrote: name = %q", got.Name)
+	}
+}
+
+// Under the race detector, many adders and many version-mutators hitting one server concurrently must
+// not lose a single write: every AddGrant lands and no mutation clobbers a grant. This is the property
+// the axiom demands and the whole-record read-modify-write could not hold.
+func TestConcurrentGrantsSurviveVersionMutations(t *testing.T) {
+	s := open(t)
+	srv := newServer(t, s)
+
+	const n = 40
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := s.AddGrant(srv.ID, Grant{
+				Kind: "adhoc", Level: "play", Label: "u" + strconv.Itoa(i), Members: []string{"u" + strconv.Itoa(i)},
+			}); err != nil {
+				t.Errorf("AddGrant: %v", err)
+			}
+		}(i)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := s.MutateServer(srv.ID, func(cur *Server) error {
+				cur.MCVersion = "1.21." + strconv.Itoa(i)
+				return nil
+			}); err != nil {
+				t.Errorf("MutateServer: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	got, _ := s.Server(srv.ID)
+	if len(got.Grants) != n {
+		t.Fatalf("lost writes under concurrency: got %d grants, want %d", len(got.Grants), n)
 	}
 }

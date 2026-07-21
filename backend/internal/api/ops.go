@@ -182,15 +182,18 @@ func (s *Server) applyPolicy(ctx context.Context, srv store.Server, policy strin
 	if !store.ValidPolicy(policy) {
 		return srv, errors.New("unknown join policy")
 	}
-	srv.JoinPolicy = policy
-	if err := s.st.UpdateServer(srv); err != nil {
+	fresh, err := s.st.MutateServer(srv.ID, func(cur *store.Server) error {
+		cur.JoinPolicy = policy
+		return nil
+	})
+	if err != nil {
 		return srv, errors.New("could not save the policy")
 	}
-	if err := s.rt.SyncConfig(ctx, srv); err != nil {
-		return srv, err
+	if err := s.rt.SyncConfig(ctx, fresh); err != nil {
+		return fresh, err
 	}
-	s.rt.Say(ctx, srv, "hosuto: join policy is now "+policy+" (restart to apply)")
-	return srv, nil
+	s.rt.Say(ctx, fresh, "hosuto: join policy is now "+policy+" (restart to apply)")
+	return fresh, nil
 }
 
 // revokeUser takes someone off a server: out of every ad-hoc grant naming them, and out of any
@@ -202,41 +205,39 @@ func (s *Server) applyPolicy(ctx context.Context, srv store.Server, policy strin
 // someone who is on via a contax or OS group — that membership belongs to the group, not to hosuto
 // — so it reports that rather than doing nothing.
 func (s *Server) revokeUser(ctx context.Context, srv store.Server, target string) error {
-	fresh, ok := s.st.Server(srv.ID)
-	if !ok {
-		return store.ErrNotFound
-	}
-	changed := false
-	var kept []store.Grant
-	for _, g := range fresh.Grants {
-		if g.Kind == "minecraft" && strings.EqualFold(g.Label, target) {
-			changed = true
-			continue
-		}
-		if g.Kind == "adhoc" {
-			var members []string
-			for _, m := range g.Members {
-				if m != target {
-					members = append(members, m)
-				}
-			}
-			if len(members) != len(g.Members) {
+	fresh, err := s.st.MutateServer(srv.ID, func(cur *store.Server) error {
+		changed := false
+		var kept []store.Grant
+		for _, g := range cur.Grants {
+			if g.Kind == "minecraft" && strings.EqualFold(g.Label, target) {
 				changed = true
+				continue
 			}
-			if len(members) == 0 {
-				continue // an ad-hoc grant with nobody left is just noise
+			if g.Kind == "adhoc" {
+				var members []string
+				for _, m := range g.Members {
+					if m != target {
+						members = append(members, m)
+					}
+				}
+				if len(members) != len(g.Members) {
+					changed = true
+				}
+				if len(members) == 0 {
+					continue // an ad-hoc grant with nobody left is just noise
+				}
+				g.Members = members
 			}
-			g.Members = members
+			kept = append(kept, g)
 		}
-		kept = append(kept, g)
-	}
-	if !changed {
-		return errors.New("that member is not on this server, or was added through a group")
-	}
-	fresh.Grants = kept
-	if err := s.st.UpdateServer(fresh); err != nil {
+		if !changed {
+			return errors.New("that member is not on this server, or was added through a group")
+		}
+		cur.Grants = kept
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	fresh, _ = s.st.Server(srv.ID)
 	return s.applyMembers(ctx, fresh)
 }
