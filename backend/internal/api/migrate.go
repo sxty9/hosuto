@@ -578,9 +578,24 @@ func (s *Server) runImport(h *jobs.Handle, srv store.Server, req importReq, zipP
 	}
 	h.Notes(det.Notes)
 
+	// commit persists the fields reconcile and Provision establish (loader, version build, heap, policy)
+	// onto the live record as one atomic access. Wholesale replacement would let an import clobber a
+	// concurrent write and, on the error paths below, could leave a half-reconciled record visible to
+	// another request; a field write touches only what the import owns.
+	commit := func(from store.Server) (store.Server, error) {
+		return s.st.MutateServer(from.ID, func(cur *store.Server) error {
+			cur.Loader = from.Loader
+			cur.MCVersion = from.MCVersion
+			cur.LoaderVersion = from.LoaderVersion
+			cur.JoinPolicy = from.JoinPolicy
+			cur.HeapMB = from.HeapMB
+			return nil
+		})
+	}
+
 	srv, err = s.reconcile(ctx, h, srv, det, req)
 	if err != nil {
-		_ = s.st.UpdateServer(srv) // keep whatever we did establish
+		_, _ = commit(srv) // keep whatever we did establish
 		return err
 	}
 
@@ -593,12 +608,14 @@ func (s *Server) runImport(h *jobs.Handle, srv store.Server, req importReq, zipP
 	}
 	srv, err = s.rt.Provision(ctx, srv, false)
 	if err != nil {
-		_ = s.st.UpdateServer(srv)
+		_, _ = commit(srv)
 		return err
 	}
-	if err := s.st.UpdateServer(srv); err != nil {
+	saved, err := commit(srv)
+	if err != nil {
 		return errors.New("could not save the server")
 	}
+	srv = saved
 
 	if err := s.adoptMods(ctx, h, &srv, det); err != nil {
 		return err
