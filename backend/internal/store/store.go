@@ -149,7 +149,7 @@ func ValidPolicy(p string) bool { return p == "whitelist" || p == "open" }
 func ValidKind(k string) bool {
 	return k == "adhoc" || k == "contax" || k == "holistic" || k == "minecraft"
 }
-func ValidLevel(l string) bool  { return l == "play" || l == "op" }
+func ValidLevel(l string) bool { return l == "play" || l == "op" }
 
 // ModsOnly reports whether this loader runs client-side mods at all. Paper runs Bukkit PLUGINS,
 // which are server-only: there is nothing to hand a Paper player. The UI must say so rather than
@@ -168,7 +168,7 @@ func LoaderHasClientMods(l string) bool { return l == "fabric" || l == "neoforge
 // mod records its project and version, so instantiating a template can restore that provenance
 // instead of degrading every mod to an anonymous jar the Modding tab cannot act on.
 type Template struct {
-	ID            string `json:"id"`   // tpl-xxxxxxxx
+	ID            string `json:"id"` // tpl-xxxxxxxx
 	Name          string `json:"name"`
 	Owner         string `json:"owner"` // Linux username; templates are owned like servers are
 	Game          string `json:"game"`
@@ -181,8 +181,8 @@ type Template struct {
 	// IncludeWorld records what the creator chose. A template without a world starts every server
 	// from a fresh one; a template with it is a clone, and the UI must be able to say which it is
 	// before someone instantiates four gigabytes by accident.
-	IncludeWorld bool  `json:"includeWorld"`
-	Size         int64 `json:"size"` // payload bytes, for the same reason
+	IncludeWorld bool   `json:"includeWorld"`
+	Size         int64  `json:"size"` // payload bytes, for the same reason
 	SourceSlug   string `json:"sourceSlug,omitempty"`
 	Created      int64  `json:"created"`
 }
@@ -417,16 +417,30 @@ func (s *Store) CreateServer(srv Server) (Server, error) {
 	return srv, s.save()
 }
 
-// UpdateServer replaces a server record wholesale. Callers read-modify-write.
-func (s *Store) UpdateServer(srv Server) error {
+// MutateServer atomically reads a server, lets fn change it, and writes it back — the whole
+// read-modify-write runs under one lock hold, so a concurrent write can be neither lost nor observed
+// half-applied. It is the store's answer to the Atomare-Zugriffe invariant, and it replaces the
+// wholesale UpdateServer that made every caller do the read and the write as two separate accesses:
+// between those two, a grant added or a mod installed on another request would be clobbered by the
+// stale snapshot the caller was about to persist.
+//
+// fn receives the CURRENT record and must change only the fields its operation owns. Everything it
+// leaves untouched is carried over from the live server, not from whatever the caller read earlier —
+// that is what keeps an unrelated concurrent change intact. Returning an error from fn aborts the
+// write and surfaces that error unchanged (so a caller may use it to signal "nothing to do").
+func (s *Store) MutateServer(id string, fn func(*Server) error) (Server, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.st.Servers[srv.ID]; !ok {
-		return ErrNotFound
+	srv, ok := s.st.Servers[id]
+	if !ok {
+		return Server{}, ErrNotFound
+	}
+	if err := fn(&srv); err != nil {
+		return Server{}, err
 	}
 	srv.Mods = identifyMods(srv.Mods)
-	s.st.Servers[srv.ID] = srv
-	return s.save()
+	s.st.Servers[id] = srv
+	return srv, s.save()
 }
 
 // DeleteServer drops a server record. The caller has already destroyed the unit and the on-disk
@@ -615,7 +629,7 @@ func (s *Store) SetMods(serverID string, mods []Mod) error {
 }
 
 // identifyMods gives every mod an id and a timestamp. It runs on every write path that can carry a
-// mod set (CreateServer, UpdateServer, SetMods), so the invariant holds regardless of how the set
+// mod set (CreateServer, MutateServer, SetMods), so the invariant holds regardless of how the set
 // got here — a mod restored from a template or adopted from a migration arrives without one, and no
 // caller should have to remember that.
 func identifyMods(mods []Mod) []Mod {

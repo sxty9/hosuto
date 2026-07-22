@@ -666,7 +666,18 @@ func (s *Server) createServer(w http.ResponseWriter, r *http.Request, u *auth.Us
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := s.st.UpdateServer(srv); err != nil {
+	// Persist only what provisioning established — the resolved loader build, and for a template the
+	// policy and mod set it carried — onto the CURRENT record. The server has been listable since
+	// reserve() registered it, so an atomic field write keeps this from clobbering anything a
+	// concurrent request added while Create/fromTemplate was downloading.
+	provisioned := srv
+	srv, err = s.st.MutateServer(provisioned.ID, func(cur *store.Server) error {
+		cur.LoaderVersion = provisioned.LoaderVersion
+		cur.JoinPolicy = provisioned.JoinPolicy
+		cur.Mods = provisioned.Mods
+		return nil
+	})
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the server")
 		return
 	}
@@ -1543,15 +1554,20 @@ func (s *Server) setVersion(w http.ResponseWriter, r *http.Request, u *auth.User
 		kept = append(kept, m)
 	}
 
-	// resolvedLoader, not body.LoaderVersion: an empty request means "newest", and Install is the only
-	// thing that knows which one that turned out to be.
-	srv.MCVersion, srv.Loader, srv.LoaderVersion = body.MCVersion, body.Loader, resolvedLoader
-	srv.Mods = kept
-	// exec.argv now names a different loader build (and possibly a different Minecraft), and on a pair
-	// change every jar under mods/ was replaced too. Either way a live server is running none of it
-	// until it is bounced — no exceptions worth carving out here.
-	srv.RestartRequired = true
-	if err := s.st.UpdateServer(srv); err != nil {
+	// The version change re-resolves the whole mod set, so it is applied atomically on the CURRENT
+	// record: the download loop above ran for seconds, and a grant added meanwhile must survive rather
+	// than be clobbered by this write. resolvedLoader, not body.LoaderVersion: an empty request means
+	// "newest", and Install is the only thing that knows which one that turned out to be.
+	srv, err = s.st.MutateServer(srv.ID, func(cur *store.Server) error {
+		cur.MCVersion, cur.Loader, cur.LoaderVersion = body.MCVersion, body.Loader, resolvedLoader
+		cur.Mods = kept
+		// exec.argv now names a different loader build (and possibly a different Minecraft), and on a pair
+		// change every jar under mods/ was replaced too. Either way a live server is running none of it
+		// until it is bounced — no exceptions worth carving out here.
+		cur.RestartRequired = true
+		return nil
+	})
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the version")
 		return
 	}
